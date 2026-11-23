@@ -1,7 +1,11 @@
 package com.goydevv.studrblx.audio;
 
+import android.content.Context;
 import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.media.MediaPlayer;
+import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import com.goydevv.studrblx.core.OutputLog;
@@ -16,6 +20,7 @@ import com.goydevv.studrblx.model.Vector3;
 import com.goydevv.studrblx.net.AssetFetcher;
 import com.goydevv.studrblx.render.FlyCamera;
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -31,6 +36,7 @@ import kotlin.enums.EnumEntries;
 import kotlin.enums.EnumEntriesKt;
 import kotlin.jvm.functions.Function0;
 import kotlin.jvm.functions.Function1;
+import kotlin.jvm.functions.Function2;
 import kotlin.jvm.internal.Intrinsics;
 import kotlin.ranges.RangesKt;
 
@@ -41,13 +47,43 @@ public final class AudioEngine {
     private static final int MAX_VOICES = 28;
     private static final Handler h;
     private static final HashSet<Long> missing;
-    private static Function1<? super Instance, Unit> onEnded;
-    private static Function1<? super Instance, Unit> onLoaded;
+    private static volatile Function2<? super Instance, ? super Integer, Unit> onDidLoop;
+    private static volatile Function1<? super Instance, Unit> onEnded;
+    private static volatile Function1<? super Instance, Unit> onLoaded;
     private static volatile Preview preview;
     private static final CopyOnWriteArrayList<Function0<Unit>> previewListeners;
     private static MediaPlayer previewPlayer;
     private static final HandlerThread thread;
+    private static final CopyOnWriteArrayList<Instance> transientSounds;
     private static final IdentityHashMap<Instance, Voice> voices;
+
+    private static volatile AudioManager audioManager;
+    private static volatile AudioFocusRequest audioFocusRequest;
+    private static volatile boolean hasAudioFocus;
+    private static volatile boolean appPaused;
+    private static volatile float duckFactor = 1.0f;
+
+    private static final AudioManager.OnAudioFocusChangeListener focusListener = new AudioManager.OnAudioFocusChangeListener() {
+        @Override
+        public void onAudioFocusChange(int focusChange) {
+            if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+                duckFactor = 1.0f;
+                hasAudioFocus = true;
+                if (!appPaused) {
+                    INSTANCE.resumeAllVoicesOnHandler();
+                }
+            } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
+                duckFactor = 0.25f;
+            } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                duckFactor = 0.0f;
+                INSTANCE.pauseAllVoicesOnHandler();
+            } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
+                hasAudioFocus = false;
+                duckFactor = 0.0f;
+                INSTANCE.pauseAllVoicesOnHandler();
+            }
+        }
+    };
 
     /* JADX INFO: compiled from: AudioEngine.kt */
     public enum PreviewState {
@@ -94,6 +130,16 @@ public final class AudioEngine {
         }
     }
 
+    private static final class ListenerPose {
+        final Vector3 pos;
+        final Vector3 right;
+
+        ListenerPose(Vector3 pos, Vector3 right) {
+            this.pos = pos;
+            this.right = right;
+        }
+    }
+
     private AudioEngine() {
     }
 
@@ -104,29 +150,185 @@ public final class AudioEngine {
         h = new Handler(thread.getLooper());
         voices = new IdentityHashMap<>();
         missing = new HashSet<>();
+        transientSounds = new CopyOnWriteArrayList<>();
         previewListeners = new CopyOnWriteArrayList<>();
+    }
+
+    public final void init(Context ctx) {
+        if (ctx == null) {
+            return;
+        }
+        try {
+            Object svc = ctx.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
+            if (svc instanceof AudioManager) {
+                audioManager = (AudioManager) svc;
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public final void requestAudioFocus() {
+        AudioManager am = audioManager;
+        if (am == null || hasAudioFocus) {
+            return;
+        }
+        try {
+            int res;
+            if (Build.VERSION.SDK_INT >= 26) {
+                AudioAttributes attrs = new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_GAME)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build();
+                AudioFocusRequest req = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(attrs)
+                        .setOnAudioFocusChangeListener(focusListener)
+                        .build();
+                audioFocusRequest = req;
+                res = am.requestAudioFocus(req);
+            } else {
+                res = am.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+            }
+            if (res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                hasAudioFocus = true;
+                duckFactor = 1.0f;
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public final void abandonAudioFocus() {
+        AudioManager am = audioManager;
+        if (am == null || !hasAudioFocus) {
+            return;
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= 26 && audioFocusRequest != null) {
+                am.abandonAudioFocusRequest(audioFocusRequest);
+            } else {
+                am.abandonAudioFocus(focusListener);
+            }
+        } catch (Throwable ignored) {
+        }
+        hasAudioFocus = false;
+        duckFactor = 1.0f;
+    }
+
+    public final void onAppPause() {
+        appPaused = true;
+        pauseAllVoicesOnHandler();
+        h.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    MediaPlayer pm = previewPlayer;
+                    if (pm != null && pm.isPlaying()) {
+                        pm.pause();
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+        abandonAudioFocus();
+    }
+
+    public final void onAppResume() {
+        appPaused = false;
+        if (!voices.isEmpty()) {
+            requestAudioFocus();
+            resumeAllVoicesOnHandler();
+        }
+    }
+
+    public final void onAppDestroy() {
+        appPaused = true;
+        stopAll();
+        stopPreview();
+        abandonAudioFocus();
+    }
+
+    private final void pauseAllVoicesOnHandler() {
+        final ArrayList<Voice> snap = new ArrayList<>(voices.values());
+        h.post(new Runnable() {
+            @Override
+            public void run() {
+                for (Voice v : snap) {
+                    if (v == null || v.getReleased()) continue;
+                    try {
+                        MediaPlayer mp = v.getMp();
+                        if (mp != null && v.getPrepared() && mp.isPlaying()) {
+                            mp.pause();
+                        }
+                        v.setLoudness(0.0f);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        });
+    }
+
+    private final void resumeAllVoicesOnHandler() {
+        final ArrayList<Voice> snap = new ArrayList<>(voices.values());
+        h.post(new Runnable() {
+            @Override
+            public void run() {
+                if (appPaused) return;
+                for (Voice v : snap) {
+                    if (v == null || v.getReleased() || v.getEnded() || !v.getWantPlay()) continue;
+                    if (v.getLastSpeed() <= 0.001f) continue;
+                    try {
+                        MediaPlayer mp = v.getMp();
+                        if (mp != null && v.getPrepared() && !mp.isPlaying()) {
+                            mp.start();
+                            INSTANCE.setSpeed(v, mp, v.getLastSpeed());
+                            INSTANCE.tick(v);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        });
+    }
+
+    public final void enqueueTransientSound(Instance s) {
+        if (s != null) {
+            transientSounds.add(s);
+        }
+    }
+
+    public final void removeTransientSound(Instance s) {
+        if (s != null) {
+            transientSounds.remove(s);
+        }
     }
 
     /* JADX INFO: Access modifiers changed from: private */
     /* JADX INFO: compiled from: AudioEngine.kt */
     static final class Voice {
+        private volatile float appliedSpeed;
         private volatile boolean ended;
         private volatile boolean failed;
         private final long id;
-        private float lastL;
-        private Boolean lastLoop;
+        private volatile float lastL;
         private double lastPushedPos;
-        private float lastR;
-        private float lastSpeed;
+        private volatile float lastR;
+        private volatile float lastSpeed;
         private volatile double length;
         private volatile boolean loadedNotified;
-        private MediaPlayer mp;
+        private volatile int loopCount;
+        private volatile boolean looped;
+        private volatile float loudness;
+        private volatile MediaPlayer mp;
+        private volatile int notifiedLoopCount;
+        private volatile double pendingSeek;
         private volatile double position;
-        private boolean prepared;
+        private volatile boolean prepared;
+        private volatile boolean released;
         private double seek;
+        private int seekSeq;
         private int seq;
         private final Instance sound;
-        private boolean wantPlay;
+        private volatile boolean ticking;
+        private volatile boolean wantPlay;
 
         public Voice(Instance sound, long id) {
             Intrinsics.checkNotNullParameter(sound, "sound");
@@ -135,10 +337,15 @@ public final class AudioEngine {
             this.lastL = -1.0f;
             this.lastR = -1.0f;
             this.lastSpeed = -1.0f;
+            this.appliedSpeed = 1.0f;
             this.seek = -1.0d;
+            this.pendingSeek = -1.0d;
             Object obj = this.sound.getAttributes().get("__playSeq");
             Integer num = obj instanceof Integer ? (Integer) obj : null;
             this.seq = num != null ? num.intValue() : 0;
+            Object sobj = this.sound.getAttributes().get("__seekSeq");
+            Integer snum = sobj instanceof Integer ? (Integer) sobj : null;
+            this.seekSeq = snum != null ? snum.intValue() : 0;
         }
 
         public final long getId() {
@@ -165,12 +372,32 @@ public final class AudioEngine {
             this.prepared = z;
         }
 
-        public final float getLastL() {
-            return this.lastL;
+        public final boolean getReleased() {
+            return this.released;
         }
 
-        public final Boolean getLastLoop() {
-            return this.lastLoop;
+        public final void setReleased(boolean z) {
+            this.released = z;
+        }
+
+        public final boolean getLooped() {
+            return this.looped;
+        }
+
+        public final void setLooped(boolean z) {
+            this.looped = z;
+        }
+
+        public final boolean getTicking() {
+            return this.ticking;
+        }
+
+        public final void setTicking(boolean z) {
+            this.ticking = z;
+        }
+
+        public final float getLastL() {
+            return this.lastL;
         }
 
         public final float getLastR() {
@@ -181,16 +408,28 @@ public final class AudioEngine {
             return this.lastSpeed;
         }
 
+        public final float getAppliedSpeed() {
+            return this.appliedSpeed;
+        }
+
+        public final void setAppliedSpeed(float f) {
+            this.appliedSpeed = f;
+        }
+
+        public final float getLoudness() {
+            return this.loudness;
+        }
+
+        public final void setLoudness(float f) {
+            this.loudness = f;
+        }
+
         public final boolean getWantPlay() {
             return this.wantPlay;
         }
 
         public final void setLastL(float f) {
             this.lastL = f;
-        }
-
-        public final void setLastLoop(Boolean bool) {
-            this.lastLoop = bool;
         }
 
         public final void setLastR(float f) {
@@ -261,12 +500,59 @@ public final class AudioEngine {
             this.seek = d;
         }
 
+        public final double getPendingSeek() {
+            return this.pendingSeek;
+        }
+
+        public final void setPendingSeek(double d) {
+            this.pendingSeek = d;
+        }
+
+        public final double consumePendingSeek() {
+            double s = this.pendingSeek;
+            if (s >= 0.0d) {
+                this.pendingSeek = -1.0d;
+            }
+            return s;
+        }
+
         public final int getSeq() {
             return this.seq;
         }
 
         public final void setSeq(int i) {
             this.seq = i;
+        }
+
+        public final int getSeekSeq() {
+            return this.seekSeq;
+        }
+
+        public final void setSeekSeq(int i) {
+            this.seekSeq = i;
+        }
+
+        public final int getLoopCount() {
+            return this.loopCount;
+        }
+
+        public final int incrementLoopCount() {
+            int next = this.loopCount + 1;
+            this.loopCount = next;
+            return next;
+        }
+
+        public final void resetLoopCount() {
+            this.loopCount = 0;
+            this.notifiedLoopCount = 0;
+        }
+
+        public final int getNotifiedLoopCount() {
+            return this.notifiedLoopCount;
+        }
+
+        public final void setNotifiedLoopCount(int i) {
+            this.notifiedLoopCount = i;
         }
     }
 
@@ -286,6 +572,14 @@ public final class AudioEngine {
         onEnded = function1;
     }
 
+    public final Function2<Instance, Integer, Unit> getOnDidLoop() {
+        return (Function2<Instance, Integer, Unit>) onDidLoop;
+    }
+
+    public final void setOnDidLoop(Function2<? super Instance, ? super Integer, Unit> function2) {
+        onDidLoop = function2;
+    }
+
     private final Long soundId(Instance s) {
         return AssetFetcher.INSTANCE.idOf(s.get("SoundId"));
     }
@@ -296,514 +590,425 @@ public final class AudioEngine {
         return number != null ? number.floatValue() : d;
     }
 
-    /* JADX WARN: Code duplicated, block: B:101:0x0274  */
-    /* JADX WARN: Code duplicated, block: B:103:0x02b4  */
-    /* JADX WARN: Code duplicated, block: B:104:0x02b7  */
-    /* JADX WARN: Code duplicated, block: B:106:0x02ba  */
-    /* JADX WARN: Code duplicated, block: B:107:0x02bf  */
-    /* JADX WARN: Code duplicated, block: B:110:0x02c5  */
-    /* JADX WARN: Code duplicated, block: B:111:0x02c8  */
-    /* JADX WARN: Code duplicated, block: B:113:0x02cc  */
-    /* JADX WARN: Code duplicated, block: B:114:0x02ce  */
-    /* JADX WARN: Code duplicated, block: B:119:0x02d7  */
-    /* JADX WARN: Code duplicated, block: B:122:0x02f0  */
-    /* JADX WARN: Code duplicated, block: B:123:0x031e  */
-    /* JADX WARN: Code duplicated, block: B:124:0x0328  */
-    /* JADX WARN: Code duplicated, block: B:127:0x0370  */
-    /* JADX WARN: Code duplicated, block: B:128:0x0374  */
-    /* JADX WARN: Code duplicated, block: B:130:0x0377  */
-    /* JADX WARN: Code duplicated, block: B:131:0x037c  */
-    /* JADX WARN: Code duplicated, block: B:134:0x0383  */
-    /* JADX WARN: Code duplicated, block: B:136:0x038c  */
-    /* JADX WARN: Code duplicated, block: B:137:0x0399  */
-    /* JADX WARN: Code duplicated, block: B:138:0x039c  */
-    /* JADX WARN: Code duplicated, block: B:153:0x03e6  */
-    /* JADX WARN: Code duplicated, block: B:160:0x0445  */
-    /* JADX WARN: Code duplicated, block: B:163:0x045f  */
-    /* JADX WARN: Code duplicated, block: B:164:0x0473  */
-    /* JADX WARN: Code duplicated, block: B:169:0x049a  */
-    /* JADX WARN: Code duplicated, block: B:208:0x04a9 A[SYNTHETIC] */
-    /* JADX WARN: Code duplicated, block: B:209:0x047a A[SYNTHETIC] */
-    /* JADX WARN: Code duplicated, block: B:72:0x01ef  */
-    /* JADX WARN: Code duplicated, block: B:73:0x0206  */
-    /* JADX WARN: Code duplicated, block: B:75:0x020c  */
-    /* JADX WARN: Code duplicated, block: B:76:0x0211  */
-    /* JADX WARN: Code duplicated, block: B:97:0x0266  */
-    public final void update(Studio studio) {
-        Voice v = null;
-        float f;
-        boolean z = false;
-        Instance parent;
-        String className;
-        Vector3 emitter;
-        Instance parent2;
-        Instance parent3;
-        Vector3 zero;
-        float left;
-        float left2;
-        float mn;
-        float l = 0.0f;
-        float r = 0.0f;
-        float speed = 1.0f;
-        boolean loop = false;
-        Voice vv = null;
-        Object obj;
-        Integer num;
-        int seq;
-        Voice vv2;
-        boolean z2;
-        Function1<? super Instance, Unit> function1;
-        Function1<? super Instance, Unit> function2;
-        float d;
-        float mn2;
-        float mx;
-        Object obj2;
-        EnumValue enumValue;
-        int mode;
+    private final float computeRolloffGain(float d, float mn, float mx, int mode, float rollScale) {
+        if (d <= mn) {
+            return 1.0f;
+        }
+        if (d >= mx) {
+            return 0.0f;
+        }
+        float denom = Math.max(mx - mn, 0.0001f);
+        float lin = Math.max(0.0f, 1.0f - ((d - mn) / denom));
+        float rs = Math.max(rollScale, 0.0001f);
+        float inv = mn / (mn + ((d - mn) * rs));
         float gain;
-        Vector3 dir;
-        List<Instance> list;
+        switch (mode) {
+            case 1: // Linear
+                gain = lin;
+                break;
+            case 2: // LinearSquare
+                gain = lin * lin;
+                break;
+            case 3: // InverseTapered
+                gain = Math.min(inv, lin * lin);
+                break;
+            case 0: // Inverse
+            default:
+                gain = inv;
+                break;
+        }
+        return RangesKt.coerceIn(gain, 0.0f, 1.0f);
+    }
+
+    private final float computeSoundGroupGain(Instance sound) {
+        Object sgObj = sound.get("SoundGroup");
+        if (!(sgObj instanceof Instance)) {
+            return 1.0f;
+        }
+        float gain = 1.0f;
+        Set<Instance> visited = Collections.newSetFromMap(new IdentityHashMap<Instance, Boolean>());
+        Instance cur = (Instance) sgObj;
+        int depth = 0;
+        while (cur != null && depth < 16 && visited.add(cur)) {
+            gain *= RangesKt.coerceIn(num(cur, "Volume", 0.5f), 0.0f, 10.0f);
+            Instance parent = cur.getParent();
+            if (parent != null && "SoundGroup".equals(parent.getClassName())) {
+                cur = parent;
+            } else {
+                cur = null;
+            }
+            depth++;
+        }
+        return gain;
+    }
+
+    private final ListenerPose resolveListener(Instance soundService, FlyCamera cam) {
+        Vector3 defaultPos = cam.getPos();
+        Vector3 defaultRight = cam.getRight();
+        if (soundService == null) {
+            return new ListenerPose(defaultPos, defaultRight);
+        }
+        Object ltObj = soundService.getAttributes().get("__listenerType");
+        int lt = (ltObj instanceof Integer) ? ((Integer) ltObj).intValue() : 0;
+        Object lv = soundService.getAttributes().get("__listenerValue");
+        if (lt == 1 && lv instanceof CFrame) {
+            CFrame cf = (CFrame) lv;
+            return new ListenerPose(cf.getPosition(), cf.getRightVector());
+        }
+        if ((lt == 2 || lt == 3) && lv instanceof Instance) {
+            Instance obj = (Instance) lv;
+            CFrame objCf = null;
+            if (obj.isA("BasePart")) {
+                objCf = PartData.INSTANCE.cframe(obj);
+            } else if ("Attachment".equals(obj.getClassName())) {
+                Instance bp = obj.getParent();
+                if (bp != null && bp.isA("BasePart")) {
+                    Object cfObj = obj.get("CFrame");
+                    CFrame localCf = (cfObj instanceof CFrame) ? (CFrame) cfObj : CFrame.INSTANCE.getIDENTITY();
+                    objCf = PartData.INSTANCE.cframe(bp).times(localCf);
+                }
+            } else {
+                Object cfObj = obj.get("CFrame");
+                if (cfObj instanceof CFrame) {
+                    objCf = (CFrame) cfObj;
+                }
+            }
+            if (objCf != null) {
+                if (lt == 2) {
+                    return new ListenerPose(objCf.getPosition(), defaultRight);
+                }
+                return new ListenerPose(objCf.getPosition(), objCf.getRightVector());
+            }
+        }
+        return new ListenerPose(defaultPos, defaultRight);
+    }
+
+    private final float computePcmLoudness(byte[] pcm, int len) {
+        if (pcm == null || len < 2) {
+            return 0.0f;
+        }
+        int samples = len / 2;
+        double sumSq = 0.0d;
+        for (int i = 0; i + 1 < len; i += 2) {
+            short sample = (short) ((pcm[i] & 0xFF) | (pcm[i + 1] << 8));
+            double norm = sample / 32768.0d;
+            sumSq += norm * norm;
+        }
+        double rms = Math.sqrt(sumSq / samples);
+        return (float) Math.min(1000.0d, Math.max(0.0d, rms * 1000.0d));
+    }
+
+    private final Vector3 resolveEmitterPosition(Instance s) {
+        Instance parent = s.getParent();
+        if (parent != null) {
+            if (parent.isA("BasePart")) {
+                return PartData.INSTANCE.cframe(parent).getPosition();
+            }
+            if ("Attachment".equals(parent.getClassName())) {
+                Instance bp = parent.getParent();
+                if (bp != null && bp.isA("BasePart")) {
+                    Object cfObj = parent.get("CFrame");
+                    Vector3 localPos = (cfObj instanceof CFrame) ? ((CFrame) cfObj).getPosition() : Vector3.INSTANCE.getZERO();
+                    return PartData.INSTANCE.cframe(bp).times(localPos);
+                }
+            }
+        }
+        Object lastPos = s.getAttributes().get("__lastEmitterPos");
+        if (lastPos instanceof Vector3) {
+            return (Vector3) lastPos;
+        }
+        return null;
+    }
+
+    public final void update(Studio studio) {
         Intrinsics.checkNotNullParameter(studio, "studio");
         PlaySession play = studio.getPlay();
         if (play == null) {
-            if (voices.isEmpty()) {
-                return;
+            if (!voices.isEmpty() || !transientSounds.isEmpty()) {
+                stopAll();
             }
-            stopAll();
             return;
         }
-        List<Instance> listAudibleSounds = studio.audibleSounds();
-        Set alive = Collections.newSetFromMap(new IdentityHashMap());
-        FlyCamera cam = studio.getCamera();
-        float master = Settings.INSTANCE.getVolume() / 10.0f;
-        for (Instance s : listAudibleSounds) {
-            if (s.getParent() != null) {
-                alive.add(s);
-                boolean playing = Intrinsics.areEqual(s.get("Playing"), (Object) true) || Intrinsics.areEqual(s.get("IsPlaying"), (Object) true);
-                Voice v2 = voices.get(s);
-                Long id = soundId(s);
-                if (v2 != null) {
-                    long id2 = v2.getId();
-                    if (id == null || id2 != id.longValue()) {
-                        release(v2);
-                        voices.remove(s);
-                        v2 = null;
-                    }
-                }
-                if (!playing) {
-                    if (v2 != null && v2.getWantPlay()) {
-                        v2.setWantPlay(false);
-                        final boolean stopped = num(s, "TimePosition", 0.0f) == 0.0f;
-                        final Voice vv3 = v2;
-                        h.post(new Runnable() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda4
-                            @Override // java.lang.Runnable
-                            public final void run() {
-                                AudioEngine.update$lambda$2(vv3, stopped);
+        List<Instance> audible = studio.audibleSounds();
+        ArrayList<Instance> allSounds = new ArrayList<>(audible.size() + transientSounds.size());
+        Set<Instance> seen = Collections.newSetFromMap(new IdentityHashMap<Instance, Boolean>());
+        for (Instance s : audible) {
+            if (s != null && seen.add(s)) {
+                allSounds.add(s);
+            }
+        }
+        for (Instance ts : transientSounds) {
+            if (ts != null && seen.add(ts)) {
+                allSounds.add(ts);
+            }
+        }
+
+        Set<Instance> alive = Collections.newSetFromMap(new IdentityHashMap<Instance, Boolean>());
+        Instance ss = studio.getModel().findService("SoundService");
+        ListenerPose listener = resolveListener(ss, studio.getCamera());
+        float rollScale = ss != null ? RangesKt.coerceIn(num(ss, "RolloffScale", 1.0f), 0.0f, 10.0f) : 1.0f;
+        float master = (Settings.INSTANCE.getVolume() / 10.0f) * duckFactor;
+
+        for (Instance s : allSounds) {
+            boolean isTransient = Boolean.TRUE.equals(s.getAttributes().get("__oneShot"))
+                    || Boolean.TRUE.equals(s.getAttributes().get("__playOnRemoveActive"))
+                    || transientSounds.contains(s);
+            if (s.getParent() == null && !isTransient) {
+                continue;
+            }
+            alive.add(s);
+            boolean playing = Intrinsics.areEqual(s.get("Playing"), Boolean.TRUE)
+                    || Intrinsics.areEqual(s.get("IsPlaying"), Boolean.TRUE);
+            Voice v = voices.get(s);
+            Long id = soundId(s);
+            if (v != null && (id == null || v.getId() != id.longValue())) {
+                release(v);
+                voices.remove(s);
+                v = null;
+            }
+
+            if (!playing) {
+                if (v != null) {
+                    if (v.getWantPlay()) {
+                        v.setWantPlay(false);
+                        v.setLoudness(0.0f);
+                        final boolean stopped = Boolean.TRUE.equals(s.getAttributes().get("__stopFlag"))
+                                || num(s, "TimePosition", 0.0f) == 0.0f;
+                        if (stopped) {
+                            v.setPosition(0.0d);
+                            v.setLastPushedPos(0.0d);
+                            v.resetLoopCount();
+                        }
+                        final Voice vvPause = v;
+                        h.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                AudioEngine.update$lambda$2(vvPause, stopped);
                             }
                         });
                     }
-                } else if (id != null) {
-                    if (v2 != null) {
-                        v = v2;
-                    } else if (voices.size() < 28) {
-                        boolean bytes = AssetFetcher.INSTANCE.isCached(id.longValue());
-                        if (!bytes) {
-                            PlaySession play2 = play;
-                            AssetFetcher.INSTANCE.request(id.longValue());
-                            if (missing.contains(id)) {
-                                list = listAudibleSounds;
-                            } else {
-                                list = listAudibleSounds;
-                                if (AssetFetcher.INSTANCE.lastError(id.longValue()) != null) {
-                                    missing.add(id);
-                                    OutputLog.INSTANCE.warn("Couldn't load sound " + s.fullName() + " (rbxassetid://" + id + "): " + AssetFetcher.INSTANCE.lastError(id.longValue()));
-                                }
+                    Object ssqObj = s.getAttributes().get("__seekSeq");
+                    int sseq = (ssqObj instanceof Integer) ? ((Integer) ssqObj).intValue() : 0;
+                    if (sseq != v.getSeekSeq()) {
+                        v.setSeekSeq(sseq);
+                        final double tp = Math.max(0.0d, (double) num(s, "TimePosition", 0.0f));
+                        v.setPendingSeek(tp);
+                        v.setPosition(tp);
+                        v.setLastPushedPos(tp);
+                        final Voice vvSeek = v;
+                        h.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                AudioEngine.seekVoiceOnHandler(vvSeek, tp, false);
                             }
-                            listAudibleSounds = list;
-                            play = play2;
-                        } else {
-                            Voice v3 = new Voice(s, id.longValue());
-                            voices.put(s, v3);
-                            double start = num(s, "TimePosition", 0.0f);
-                            v3.setSeek(start);
-                            create(v3);
-                            v = v3;
-                        }
+                        });
                     }
-                    if (v == null || v.getFailed()) {
-                    } else {
-                        float vol = RangesKt.coerceIn(num(s, "Volume", 0.5f), 0.0f, 10.0f);
-                        Object obj3 = s.get("SoundGroup");
-                        Instance instance = obj3 instanceof Instance ? (Instance) obj3 : null;
-                        if (instance != null) {
-                            vol *= RangesKt.coerceIn(INSTANCE.num(instance, "Volume", 1.0f), 0.0f, 10.0f);
-                        }
-                        float vol2 = vol * master;
-                        float right = 1.0f;
-                        Instance parent4 = s.getParent();
-                        if (parent4 != null) {
-                            f = 1.0f;
-                            z = parent4.isA("BasePart");
-                            if (z) {
-                                PartData partData = PartData.INSTANCE;
-                                Instance parent5 = s.getParent();
-                                Intrinsics.checkNotNull(parent5);
-                                emitter = partData.cframe(parent5).getPosition();
-                            } else {
-                                parent = s.getParent();
-                                if (parent != null) {
-                                    className = parent.getClassName();
-                                } else {
-                                    className = null;
-                                }
-                                if (Intrinsics.areEqual(className, "Attachment") || (parent2 = s.getParent()) == null || (parent3 = parent2.getParent()) == null) {
-                                    emitter = null;
-                                } else {
-                                    if (!parent3.isA("BasePart")) {
-                                        parent3 = null;
-                                    }
-                                    if (parent3 != null) {
-                                        CFrame cframe = PartData.INSTANCE.cframe(parent3);
-                                        Instance parent6 = s.getParent();
-                                        Intrinsics.checkNotNull(parent6);
-                                        Object obj4 = parent6.get("CFrame");
-                                        CFrame cFrame = obj4 instanceof CFrame ? (CFrame) obj4 : null;
-                                        if (cFrame == null || (zero = cFrame.getPosition()) == null) {
-                                            zero = Vector3.INSTANCE.getZERO();
-                                        }
-                                        emitter = cframe.times(zero);
-                                    } else {
-                                        emitter = null;
-                                    }
-                                }
-                            }
-                            if (emitter != null) {
-                                left = 1.0f;
-                                left2 = f;
-                                mn = 0.0f;
-                            } else {
-                                d = emitter.minus(cam.getPos()).getMagnitude();
-                                mn2 = RangesKt.coerceAtLeast(num(s, "RollOffMinDistance", num(s, "xmlRead_MinDistance_3", 10.0f)), 0.1f);
-                                mx = RangesKt.coerceAtLeast(num(s, "RollOffMaxDistance", num(s, "xmlRead_MaxDistance_3", 10000.0f)), mn2);
-                                obj2 = s.get("RollOffMode");
-                                if (obj2 instanceof EnumValue) {
-                                    enumValue = (EnumValue) obj2;
-                                } else {
-                                    enumValue = null;
-                                }
-                                if (enumValue != null) {
-                                    mode = enumValue.getValue();
-                                } else {
-                                    mode = 0;
-                                }
-                                if (d <= mn2) {
-                                    gain = f;
-                                } else if (d >= mx) {
-                                    gain = 0.0f;
-                                } else if (mode != 1 || mode == 3) {
-                                    gain = f - ((d - mn2) / (mx - mn2));
-                                } else {
-                                    gain = mn2 / d;
-                                }
-                                vol2 *= gain;
-                                dir = emitter.minus(cam.getPos());
-                                if (d > 1056964608) {
-                                    left = 1.0f;
-                                    left2 = f;
-                                    mn = 0.0f;
-                                } else {
-                                    left2 = f;
-                                    float pan = RangesKt.coerceIn(dir.getUnit().dot(cam.getRight()), -1.0f, left2) * 0.7f;
-                                    mn = 0.0f;
-                                    float left3 = left2 - Math.max(0.0f, pan);
-                                    right = Math.min(0.0f, pan) + left2;
-                                    left = left3;
-                                }
-                            }
-                            l = RangesKt.coerceIn(vol2 * left, mn, left2);
-                            r = RangesKt.coerceIn(vol2 * right, mn, left2);
-                            speed = RangesKt.coerceIn(num(s, "PlaybackSpeed", num(s, "Pitch", left2)), 0.05f, 8.0f);
-                            loop = Intrinsics.areEqual(s.get("Looped"), (Object) true);
-                            vv = v;
-                            obj = s.getAttributes().get("__playSeq");
-                            if (obj instanceof Integer) {
-                                num = (Integer) obj;
-                            } else {
-                                num = null;
-                            }
-                            if (num != null) {
-                                seq = num.intValue();
-                            } else {
-                                seq = 0;
-                            }
-                            if (seq != vv.getSeq()) {
-                                vv.setSeq(seq);
-                                if (vv.getWantPlay()) {
-                                    final Voice _vv = vv;
-                                h.post(new Runnable() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda5
-                                        @Override // java.lang.Runnable
-                                        public final void run() {
-                                            AudioEngine.update$lambda$6(_vv);
-                                        }
-                                    });
-                                }
-                            }
-                            if (vv.getWantPlay() || Math.abs(l - vv.getLastL()) > 0.01f || Math.abs(r - vv.getLastR()) > 0.01f) {
-                                final boolean restart = !vv.getWantPlay();
-                                vv.setWantPlay(true);
-                                vv.setLastL(l);
-                                vv.setLastR(r);
-                                vv.setLastSpeed(speed);
-                                vv.setLastLoop(Boolean.valueOf(loop));
-                                final Voice _vvApply = vv; final float _lApply = l; final float _rApply = r; final float _speedApply = speed; final boolean _loopApply = loop;
-                            Handler handler = h;
-                                Runnable runnable = new Runnable() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda6
-                                    @Override // java.lang.Runnable
-                                    public final void run() {
-                                        AudioEngine.INSTANCE.apply(_vvApply, _lApply, _rApply, _speedApply, _loopApply, restart);
-                                    }
-                                };
-                                vv2 = vv;
-                                handler.post(runnable);
-                            } else if ((speed == vv.getLastSpeed()) && Intrinsics.areEqual(Boolean.valueOf(loop), vv.getLastLoop())) {
-                                vv2 = vv;
-                            } else {
-                                final boolean restart2 = !vv.getWantPlay();
-                                vv.setWantPlay(true);
-                                vv.setLastL(l);
-                                vv.setLastR(r);
-                                vv.setLastSpeed(speed);
-                                vv.setLastLoop(Boolean.valueOf(loop));
-                                final Voice _vvApply = vv; final float _lApply = l; final float _rApply = r; final float _speedApply = speed; final boolean _loopApply = loop;
-                            Handler handler2 = h;
-                                Runnable runnable2 = new Runnable() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda6
-                                    @Override // java.lang.Runnable
-                                    public final void run() {
-                                        AudioEngine.INSTANCE.apply(_vvApply, _lApply, _rApply, _speedApply, _loopApply, restart2);
-                                    }
-                                };
-                                vv2 = vv;
-                                handler2.post(runnable2);
-                            }
-                            if (vv2.getLength() > 0.0d && !vv2.getLoadedNotified()) {
-                                vv2.setLoadedNotified(true);
-                                s.set("TimeLength", Double.valueOf(vv2.getLength()), false);
-                                s.set("IsLoaded", true, false);
-                                function2 = onLoaded;
-                                if (function2 != null) {
-                                    function2.invoke(s);
-                                }
-                            }
-                            if (Math.abs(vv2.getPosition() - vv2.getLastPushedPos()) > 0.2d) {
-                                vv2.setLastPushedPos(vv2.getPosition());
-                                z2 = false;
-                                s.set("TimePosition", Double.valueOf(vv2.getPosition()), false);
-                            } else {
-                                z2 = false;
-                            }
-                            if (vv2.getEnded()) {
-                                vv2.setEnded(z2);
-                                vv2.setWantPlay(z2);
-                                s.set("TimePosition", Double.valueOf(0.0d), z2);
-                                Instance.set$default(s, "Playing", Boolean.valueOf(z2), false, 4, null);
-                                function1 = onEnded;
-                                if (function1 != null) {
-                                    function1.invoke(s);
-                                }
-                            } else {
-                            }
-                        } else {
-                            f = 1.0f;
-                        }
-                        if (z) {
-                            PartData partData2 = PartData.INSTANCE;
-                            Instance parent7 = s.getParent();
-                            Intrinsics.checkNotNull(parent7);
-                            emitter = partData2.cframe(parent7).getPosition();
-                        } else {
-                            parent = s.getParent();
-                            if (parent != null) {
-                                className = parent.getClassName();
-                            } else {
-                                className = null;
-                            }
-                            if (Intrinsics.areEqual(className, "Attachment")) {
-                                emitter = null;
-                            } else {
-                                emitter = null;
-                            }
-                        }
-                        if (emitter != null) {
-                            left = 1.0f;
-                            left2 = f;
-                            mn = 0.0f;
-                        } else {
-                            d = emitter.minus(cam.getPos()).getMagnitude();
-                            mn2 = RangesKt.coerceAtLeast(num(s, "RollOffMinDistance", num(s, "xmlRead_MinDistance_3", 10.0f)), 0.1f);
-                            mx = RangesKt.coerceAtLeast(num(s, "RollOffMaxDistance", num(s, "xmlRead_MaxDistance_3", 10000.0f)), mn2);
-                            obj2 = s.get("RollOffMode");
-                            if (obj2 instanceof EnumValue) {
-                                enumValue = (EnumValue) obj2;
-                            } else {
-                                enumValue = null;
-                            }
-                            if (enumValue != null) {
-                                mode = enumValue.getValue();
-                            } else {
-                                mode = 0;
-                            }
-                            if (d <= mn2) {
-                                gain = f;
-                            } else if (d >= mx) {
-                                gain = 0.0f;
-                            } else if (mode != 1) {
-                                gain = f - ((d - mn2) / (mx - mn2));
-                            } else {
-                                gain = f - ((d - mn2) / (mx - mn2));
-                            }
-                            vol2 *= gain;
-                            dir = emitter.minus(cam.getPos());
-                            if (d > 1056964608) {
-                                left = 1.0f;
-                                left2 = f;
-                                mn = 0.0f;
-                            } else {
-                                left2 = f;
-                                float pan2 = RangesKt.coerceIn(dir.getUnit().dot(cam.getRight()), -1.0f, left2) * 0.7f;
-                                mn = 0.0f;
-                                float left4 = left2 - Math.max(0.0f, pan2);
-                                right = Math.min(0.0f, pan2) + left2;
-                                left = left4;
-                            }
-                        }
-                        l = RangesKt.coerceIn(vol2 * left, mn, left2);
-                        r = RangesKt.coerceIn(vol2 * right, mn, left2);
-                        speed = RangesKt.coerceIn(num(s, "PlaybackSpeed", num(s, "Pitch", left2)), 0.05f, 8.0f);
-                        loop = Intrinsics.areEqual(s.get("Looped"), (Object) true);
-                        vv = v;
-                        obj = s.getAttributes().get("__playSeq");
-                        if (obj instanceof Integer) {
-                            num = (Integer) obj;
-                        } else {
-                            num = null;
-                        }
-                        if (num != null) {
-                            seq = num.intValue();
-                        } else {
-                            seq = 0;
-                        }
-                        if (seq != vv.getSeq()) {
-                            vv.setSeq(seq);
-                            if (vv.getWantPlay()) {
-                                final Voice _vv = vv;
-                                h.post(new Runnable() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda5
-                                    @Override // java.lang.Runnable
-                                    public final void run() {
-                                        AudioEngine.update$lambda$6(_vv);
-                                    }
-                                });
-                            }
-                        }
-                        if (vv.getWantPlay()) {
-                            final boolean restart3 = !vv.getWantPlay();
-                            vv.setWantPlay(true);
-                            vv.setLastL(l);
-                            vv.setLastR(r);
-                            vv.setLastSpeed(speed);
-                            vv.setLastLoop(Boolean.valueOf(loop));
-                            final Voice _vvApply = vv; final float _lApply = l; final float _rApply = r; final float _speedApply = speed; final boolean _loopApply = loop;
-                            Handler handler3 = h;
-                            Runnable runnable3 = new Runnable() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda6
-                                @Override // java.lang.Runnable
-                                public final void run() {
-                                    AudioEngine.INSTANCE.apply(_vvApply, _lApply, _rApply, _speedApply, _loopApply, restart3);
-                                }
-                            };
-                            vv2 = vv;
-                            handler3.post(runnable3);
-                        } else {
-                            final boolean restart4 = !vv.getWantPlay();
-                            vv.setWantPlay(true);
-                            vv.setLastL(l);
-                            vv.setLastR(r);
-                            vv.setLastSpeed(speed);
-                            vv.setLastLoop(Boolean.valueOf(loop));
-                            final Voice _vvApply = vv; final float _lApply = l; final float _rApply = r; final float _speedApply = speed; final boolean _loopApply = loop;
-                            Handler handler4 = h;
-                            Runnable runnable4 = new Runnable() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda6
-                                @Override // java.lang.Runnable
-                                public final void run() {
-                                    AudioEngine.INSTANCE.apply(_vvApply, _lApply, _rApply, _speedApply, _loopApply, restart4);
-                                }
-                            };
-                            vv2 = vv;
-                            handler4.post(runnable4);
-                        }
-                        if (vv2.getLength() > 0.0d) {
-                            vv2.setLoadedNotified(true);
-                            s.set("TimeLength", Double.valueOf(vv2.getLength()), false);
-                            s.set("IsLoaded", true, false);
-                            function2 = onLoaded;
-                            if (function2 != null) {
-                                function2.invoke(s);
-                            }
-                        }
-                        if (Math.abs(vv2.getPosition() - vv2.getLastPushedPos()) > 0.2d) {
-                            vv2.setLastPushedPos(vv2.getPosition());
-                            z2 = false;
-                            s.set("TimePosition", Double.valueOf(vv2.getPosition()), false);
-                        } else {
-                            z2 = false;
-                        }
-                        if (vv2.getEnded()) {
-                            vv2.setEnded(z2);
-                            vv2.setWantPlay(z2);
-                            s.set("TimePosition", Double.valueOf(0.0d), z2);
-                            Instance.set$default(s, "Playing", Boolean.valueOf(z2), false, 4, null);
-                            function1 = onEnded;
-                            if (function1 != null) {
-                                function1.invoke(s);
-                            }
-                        } else {
-                        }
+                }
+                s.set("PlaybackLoudness", Float.valueOf(0.0f), false);
+                continue;
+            }
+
+            if (id == null) {
+                continue;
+            }
+
+            if (!appPaused && !hasAudioFocus) {
+                requestAudioFocus();
+            }
+
+            if (v == null) {
+                if (voices.size() >= MAX_VOICES) {
+                    continue;
+                }
+                boolean cached = AssetFetcher.INSTANCE.isCached(id.longValue());
+                if (!cached) {
+                    AssetFetcher.INSTANCE.request(id.longValue());
+                    if (!missing.contains(id) && AssetFetcher.INSTANCE.lastError(id.longValue()) != null) {
+                        missing.add(id);
+                        OutputLog.INSTANCE.warn("Couldn't load sound " + s.fullName() + " (rbxassetid://" + id + "): " + AssetFetcher.INSTANCE.lastError(id.longValue()));
                     }
+                    continue;
+                }
+                Voice created = new Voice(s, id.longValue());
+                voices.put(s, created);
+                Object stp = s.getAttributes().remove("__scriptTimePos");
+                double startPos = (stp instanceof Number) ? Math.max(0.0d, ((Number) stp).doubleValue()) : Math.max(0.0d, (double) num(s, "TimePosition", 0.0f));
+                created.setSeek(startPos);
+                if (startPos > 0.0d) {
+                    created.setPendingSeek(startPos);
+                }
+                create(created);
+                v = created;
+            }
+
+            if (v.getFailed()) {
+                if (isTransient) {
+                    transientSounds.remove(s);
+                }
+                continue;
+            }
+
+            float vol = RangesKt.coerceIn(num(s, "Volume", 0.5f), 0.0f, 10.0f);
+            vol *= computeSoundGroupGain(s);
+            vol *= master;
+
+            float left = 1.0f;
+            float right = 1.0f;
+            Vector3 emitter = resolveEmitterPosition(s);
+            if (emitter != null) {
+                Vector3 dir = emitter.minus(listener.pos);
+                float d = dir.getMagnitude();
+                float mn = RangesKt.coerceAtLeast(num(s, "RollOffMinDistance", num(s, "xmlRead_MinDistance_3", 10.0f)), 0.1f);
+                float mx = RangesKt.coerceAtLeast(num(s, "RollOffMaxDistance", num(s, "xmlRead_MaxDistance_3", 10000.0f)), mn + 0.01f);
+                Object rmObj = s.get("RollOffMode");
+                int mode = 0;
+                if (rmObj instanceof EnumValue) {
+                    mode = ((EnumValue) rmObj).getValue();
+                } else if (rmObj instanceof Number) {
+                    mode = ((Number) rmObj).intValue();
+                }
+                vol *= computeRolloffGain(d, mn, mx, mode, rollScale);
+                if (d >= 0.5f) {
+                    float pan = RangesKt.coerceIn(dir.getUnit().dot(listener.right), -1.0f, 1.0f) * 0.7f;
+                    left = 1.0f - Math.max(0.0f, pan);
+                    right = 1.0f + Math.min(0.0f, pan);
+                }
+            }
+
+            float l = RangesKt.coerceIn(vol * left, 0.0f, 1.0f);
+            float r = RangesKt.coerceIn(vol * right, 0.0f, 1.0f);
+            float speed = RangesKt.coerceIn(num(s, "PlaybackSpeed", num(s, "Pitch", 1.0f)), 0.0f, 20.0f);
+            boolean loop = Intrinsics.areEqual(s.get("Looped"), Boolean.TRUE);
+
+            Object seqObj = s.getAttributes().get("__playSeq");
+            int seq = (seqObj instanceof Integer) ? ((Integer) seqObj).intValue() : 0;
+            if (seq != v.getSeq()) {
+                v.setSeq(seq);
+                v.setEnded(false);
+                v.resetLoopCount();
+                Object stpObj = s.getAttributes().remove("__scriptTimePos");
+                final double targetSeek = (stpObj instanceof Number) ? Math.max(0.0d, ((Number) stpObj).doubleValue()) : 0.0d;
+                v.setPendingSeek(targetSeek);
+                v.setPosition(targetSeek);
+                v.setLastPushedPos(targetSeek);
+                final Voice vvPlay = v;
+                h.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        AudioEngine.seekVoiceOnHandler(vvPlay, targetSeek, true);
+                    }
+                });
+            }
+
+            Object ssqObj = s.getAttributes().get("__seekSeq");
+            int sseq = (ssqObj instanceof Integer) ? ((Integer) ssqObj).intValue() : 0;
+            if (sseq != v.getSeekSeq()) {
+                v.setSeekSeq(sseq);
+                final double tp = Math.max(0.0d, (double) num(s, "TimePosition", 0.0f));
+                s.getAttributes().remove("__scriptTimePos");
+                v.setPendingSeek(tp);
+                v.setPosition(tp);
+                v.setLastPushedPos(tp);
+                final Voice vvSeek = v;
+                h.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        AudioEngine.seekVoiceOnHandler(vvSeek, tp, false);
+                    }
+                });
+            }
+
+            boolean needStart = !v.getWantPlay();
+            boolean volDirty = Math.abs(l - v.getLastL()) > 0.01f || Math.abs(r - v.getLastR()) > 0.01f;
+            boolean speedDirty = Math.abs(speed - v.getLastSpeed()) > 0.001f;
+            boolean loopDirty = loop != v.getLooped();
+            if (needStart || volDirty || speedDirty || loopDirty) {
+                final boolean restart = needStart;
+                v.setWantPlay(true);
+                v.setLastL(l);
+                v.setLastR(r);
+                v.setLastSpeed(speed);
+                v.setLooped(loop);
+                final Voice vvApply = v;
+                final float lApply = l;
+                final float rApply = r;
+                final float speedApply = speed;
+                final boolean loopApply = loop;
+                h.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        AudioEngine.INSTANCE.apply(vvApply, lApply, rApply, speedApply, loopApply, restart);
+                    }
+                });
+            }
+
+            if (v.getLength() > 0.0d && !v.getLoadedNotified()) {
+                v.setLoadedNotified(true);
+                s.set("TimeLength", Double.valueOf(v.getLength()), false);
+                s.set("IsLoaded", true, false);
+                Function1<? super Instance, Unit> loadedCb = onLoaded;
+                if (loadedCb != null) {
+                    loadedCb.invoke(s);
+                }
+            }
+
+            int lc = v.getLoopCount();
+            if (lc > v.getNotifiedLoopCount()) {
+                v.setNotifiedLoopCount(lc);
+                s.getAttributes().put("__loopCount", Integer.valueOf(lc));
+                Function2<? super Instance, ? super Integer, Unit> loopCb = onDidLoop;
+                if (loopCb != null) {
+                    loopCb.invoke(s, Integer.valueOf(lc));
+                }
+            }
+
+            if (v.getWantPlay() && v.getPendingSeek() < 0.0d && Math.abs(v.getPosition() - v.getLastPushedPos()) > 0.1d) {
+                v.setLastPushedPos(v.getPosition());
+                s.set("TimePosition", Double.valueOf(v.getPosition()), false);
+            }
+
+            s.set("PlaybackLoudness", Float.valueOf(v.getLoudness()), false);
+
+            if (v.getEnded()) {
+                v.setEnded(false);
+                v.setWantPlay(false);
+                v.setLoudness(0.0f);
+                s.set("TimePosition", Double.valueOf(0.0d), false);
+                s.set("PlaybackLoudness", Float.valueOf(0.0f), false);
+                s.set("IsPlaying", Boolean.FALSE, false);
+                s.set("IsPaused", Boolean.FALSE, false);
+                Instance.set$default(s, "Playing", Boolean.FALSE, false, 4, null);
+                if (isTransient) {
+                    transientSounds.remove(s);
+                }
+                Function1<? super Instance, Unit> endedCb = onEnded;
+                if (endedCb != null) {
+                    endedCb.invoke(s);
                 }
             }
         }
-        boolean z3 = false;
-        if (voices.size() <= alive.size()) {
-            Iterable iterableKeySet = voices.keySet();
-            Intrinsics.checkNotNullExpressionValue(iterableKeySet, "<get-keys>(...)");
-            Iterable iterable = iterableKeySet;
-            if (!(iterable instanceof Collection) || !((Collection) iterable).isEmpty()) {
-                Iterator it = iterable.iterator();
-                while (it.hasNext()) {
-                    if (!alive.contains((Instance) it.next())) {
-                        z3 = true;
-                        break;
-                    }
-                }
-            }
-            if (!z3) {
-                return;
-            }
-        }
-        Iterator<Map.Entry<Instance, Voice>> it2 = voices.entrySet().iterator();
-        while (it2.hasNext()) {
-            Map.Entry<Instance, Voice> next = it2.next();
-            Intrinsics.checkNotNullExpressionValue(next, "next(...)");
-            Map.Entry<Instance, Voice> entry = next;
+
+        Iterator<Map.Entry<Instance, Voice>> it = voices.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<Instance, Voice> entry = it.next();
             if (!alive.contains(entry.getKey())) {
                 Voice value = entry.getValue();
-                Intrinsics.checkNotNullExpressionValue(value, "<get-value>(...)");
-                release(value);
-                it2.remove();
+                if (value != null) {
+                    release(value);
+                }
+                it.remove();
             }
+        }
+        if (voices.isEmpty() && hasAudioFocus) {
+            abandonAudioFocus();
         }
     }
 
     static final void update$lambda$2(Voice $vv, boolean $stopped) {
         try {
+            if ($vv.getReleased()) {
+                return;
+            }
             MediaPlayer mp = $vv.getMp();
             if (mp != null) {
                 if (mp.isPlaying()) {
@@ -813,31 +1018,46 @@ public final class AudioEngine {
                     mp.seekTo(0);
                 }
             }
-        } catch (Exception e) {
+            $vv.setLoudness(0.0f);
+        } catch (Exception ignored) {
         }
     }
 
-    static final void update$lambda$6(Voice $vv) {
-        MediaPlayer mp;
+    static final void seekVoiceOnHandler(Voice $vv, double seconds, boolean ensureStart) {
         try {
-            if (!$vv.getPrepared() || (mp = $vv.getMp()) == null) {
+            if ($vv.getReleased() || !$vv.getPrepared()) {
                 return;
             }
-            mp.seekTo(0);
-        } catch (Exception e) {
+            MediaPlayer mp = $vv.getMp();
+            if (mp == null) {
+                return;
+            }
+            int ms = Math.max(0, (int) (seconds * 1000.0d));
+            mp.seekTo(ms);
+            $vv.consumePendingSeek();
+            $vv.setPosition(seconds);
+            if (ensureStart && $vv.getWantPlay() && !appPaused && $vv.getLastSpeed() > 0.001f && !mp.isPlaying()) {
+                mp.start();
+                INSTANCE.setSpeed($vv, mp, $vv.getLastSpeed());
+                INSTANCE.tick($vv);
+            }
+        } catch (Exception ignored) {
         }
     }
 
     private final void create(final Voice v) {
-        h.post(new Runnable() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda12
-            @Override // java.lang.Runnable
-            public final void run() {
+        h.post(new Runnable() {
+            @Override
+            public void run() {
                 AudioEngine.create$lambda$12(v);
             }
         });
     }
 
     static final void create$lambda$12(final Voice $v) {
+        if ($v.getReleased()) {
+            return;
+        }
         try {
             String strCacheFile = AssetFetcher.INSTANCE.cacheFile($v.getId());
             if (strCacheFile == null) {
@@ -849,21 +1069,21 @@ public final class AudioEngine {
             try (java.io.FileInputStream fis = new java.io.FileInputStream(f)) {
                 mp.setDataSource(fis.getFD());
             }
-            mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda13
-                @Override // android.media.MediaPlayer.OnPreparedListener
-                public final void onPrepared(MediaPlayer mediaPlayer) {
+            mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
+                @Override
+                public void onPrepared(MediaPlayer mediaPlayer) {
                     AudioEngine.create$lambda$12$lambda$9($v, mediaPlayer);
                 }
             });
-            mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda14
-                @Override // android.media.MediaPlayer.OnCompletionListener
-                public final void onCompletion(MediaPlayer mediaPlayer) {
+            mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
+                @Override
+                public void onCompletion(MediaPlayer mediaPlayer) {
                     AudioEngine.create$lambda$12$lambda$10($v, mediaPlayer);
                 }
             });
-            mp.setOnErrorListener(new MediaPlayer.OnErrorListener() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda15
-                @Override // android.media.MediaPlayer.OnErrorListener
-                public final boolean onError(MediaPlayer mediaPlayer, int i, int i2) {
+            mp.setOnErrorListener(new MediaPlayer.OnErrorListener() {
+                @Override
+                public boolean onError(MediaPlayer mediaPlayer, int i, int i2) {
                     return AudioEngine.create$lambda$12$lambda$11($v, mediaPlayer, i, i2);
                 }
             });
@@ -876,30 +1096,60 @@ public final class AudioEngine {
     }
 
     static final void create$lambda$12$lambda$9(Voice $v, MediaPlayer it) {
-        $v.setPrepared(true);
-        $v.setLength(((double) it.getDuration()) / 1000.0d);
-        if ($v.getSeek() > 0.0d) {
+        if ($v.getReleased()) {
             try {
-                it.seekTo((int) ($v.getSeek() * 1000.0d));
-            } catch (Exception e) {
+                it.release();
+            } catch (Exception ignored) {
+            }
+            $v.setMp(null);
+            return;
+        }
+        $v.setPrepared(true);
+        int dur = it.getDuration();
+        if (dur > 0) {
+            $v.setLength(((double) dur) / 1000.0d);
+        }
+        it.setLooping(false);
+        double pSeek = $v.consumePendingSeek();
+        double initialSeek = pSeek >= 0.0d ? pSeek : $v.getSeek();
+        if (initialSeek > 0.0d) {
+            try {
+                it.seekTo((int) (initialSeek * 1000.0d));
+                $v.setPosition(initialSeek);
+            } catch (Exception ignored) {
             }
         }
-        if ($v.getWantPlay()) {
+        if ($v.getWantPlay() && !appPaused) {
             it.setVolume(RangesKt.coerceAtLeast($v.getLastL(), 0.0f), RangesKt.coerceAtLeast($v.getLastR(), 0.0f));
-            it.setLooping(Intrinsics.areEqual((Object) $v.getLastLoop(), (Object) true));
-            AudioEngine audioEngine = INSTANCE;
-            Intrinsics.checkNotNull(it);
-            audioEngine.setSpeed(it, $v.getLastSpeed());
-            it.start();
+            if ($v.getLastSpeed() > 0.001f) {
+                it.start();
+                INSTANCE.setSpeed($v, it, $v.getLastSpeed());
+                INSTANCE.tick($v);
+            }
         }
-        INSTANCE.tick($v);
     }
 
     static final void create$lambda$12$lambda$10(Voice $v, MediaPlayer it) {
-        if (it.isLooping()) {
+        if ($v.getReleased()) {
+            return;
+        }
+        if ($v.getLooped() && $v.getWantPlay()) {
+            $v.incrementLoopCount();
+            $v.setPosition(0.0d);
+            try {
+                it.seekTo(0);
+                if (!appPaused && $v.getLastSpeed() > 0.001f) {
+                    it.start();
+                    INSTANCE.setSpeed($v, it, $v.getLastSpeed());
+                    INSTANCE.tick($v);
+                }
+            } catch (Exception ignored) {
+            }
             return;
         }
         $v.setEnded(true);
+        $v.setWantPlay(false);
+        $v.setLoudness(0.0f);
         $v.setPosition(0.0d);
     }
 
@@ -909,6 +1159,9 @@ public final class AudioEngine {
         } catch (Throwable ignored) {
         }
         $v.setMp(null);
+        if ($v.getReleased()) {
+            return true;
+        }
         String cf = AssetFetcher.INSTANCE.cacheFile($v.getId());
         if (cf != null) {
             final File af = INSTANCE.prepareAudioFile($v.getId(), new File(cf));
@@ -922,8 +1175,10 @@ public final class AudioEngine {
                                 File syn = INSTANCE.writeSynthJumpWav(new File(af.getParentFile(), "9114222045_synth.wav"));
                                 if (syn.isFile() && INSTANCE.playWithMediaCodec($v, syn)) return;
                             }
-                            $v.setFailed(true);
-                            OutputLog.INSTANCE.warn("Sound rbxassetid://" + $v.getId() + " unsupported audio codec");
+                            if (!$v.getReleased()) {
+                                $v.setFailed(true);
+                                OutputLog.INSTANCE.warn("Sound rbxassetid://" + $v.getId() + " unsupported audio codec");
+                            }
                         }
                     }
                 }, "AudioFallback-" + $v.getId()).start();
@@ -1073,23 +1328,54 @@ public final class AudioEngine {
             if (fmt.containsKey(android.media.MediaFormat.KEY_DURATION)) {
                 v.setLength(fmt.getLong(android.media.MediaFormat.KEY_DURATION) / 1000000.0d);
             }
+            double initSeek = v.consumePendingSeek();
+            if (initSeek < 0.0d && v.getSeek() > 0.0d) {
+                initSeek = v.getSeek();
+            }
+            if (initSeek > 0.0d) {
+                extractor.seekTo((long) (initSeek * 1000000.0d), android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+            }
             int chMask = channels == 1 ? android.media.AudioFormat.CHANNEL_OUT_MONO : android.media.AudioFormat.CHANNEL_OUT_STEREO;
             int minBuf = android.media.AudioTrack.getMinBufferSize(sampleRate, chMask, android.media.AudioFormat.ENCODING_PCM_16BIT);
             track = new android.media.AudioTrack.Builder()
-                .setAudioAttributes(new AudioAttributes.Builder().setUsage(14).setContentType(4).build())
-                .setAudioFormat(new android.media.AudioFormat.Builder().setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(chMask).build())
-                .setBufferSizeInBytes(Math.max(minBuf * 2, 8192))
-                .build();
-            float vol = Math.min(1.0f, Math.max(0.0f, (Settings.INSTANCE.getVolume() / 10.0f) * num(v.getSound(), "Volume", 0.5f)));
-            track.setVolume(vol);
+                    .setAudioAttributes(new AudioAttributes.Builder().setUsage(14).setContentType(4).build())
+                    .setAudioFormat(new android.media.AudioFormat.Builder().setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(chMask).build())
+                    .setBufferSizeInBytes(Math.max(minBuf * 2, 8192))
+                    .build();
+            float initL = Math.max(0.0f, v.getLastL());
+            float initR = Math.max(0.0f, v.getLastR());
+            track.setStereoVolume(initL, initR);
             track.play();
+            boolean trackPaused = false;
             codec = android.media.MediaCodec.createDecoderByType(mime);
             codec.configure(fmt, null, null, 0);
             codec.start();
             android.media.MediaCodec.BufferInfo info = new android.media.MediaCodec.BufferInfo();
             boolean sawInputEOS = false;
             boolean sawOutputEOS = false;
-            while (!sawOutputEOS && !v.getFailed()) {
+            while (!v.getReleased() && !v.getFailed()) {
+                if (!v.getWantPlay() || appPaused || v.getLastSpeed() <= 0.001f) {
+                    if (!trackPaused) {
+                        try { track.pause(); } catch (Throwable ignored) {}
+                        trackPaused = true;
+                    }
+                    v.setLoudness(0.0f);
+                    try { Thread.sleep(30L); } catch (InterruptedException ignored) {}
+                    continue;
+                }
+                if (trackPaused) {
+                    try { track.play(); } catch (Throwable ignored) {}
+                    trackPaused = false;
+                }
+                double pSeek = v.consumePendingSeek();
+                if (pSeek >= 0.0d) {
+                    extractor.seekTo((long) (pSeek * 1000000.0d), android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                    codec.flush();
+                    sawInputEOS = false;
+                    sawOutputEOS = false;
+                    v.setPosition(pSeek);
+                }
+                track.setStereoVolume(Math.max(0.0f, v.getLastL()), Math.max(0.0f, v.getLastR()));
                 if (!sawInputEOS) {
                     int inIdx = codec.dequeueInputBuffer(10000L);
                     if (inIdx >= 0) {
@@ -1113,77 +1399,137 @@ public final class AudioEngine {
                         outBuf.get(pcm);
                         track.write(pcm, 0, pcm.length);
                         v.setPosition(info.presentationTimeUs / 1000000.0d);
+                        v.setLoudness(computePcmLoudness(pcm, pcm.length));
                     }
                     codec.releaseOutputBuffer(outIdx, false);
                     if ((info.flags & android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                         sawOutputEOS = true;
                     }
                 }
+                if (sawOutputEOS) {
+                    if (v.getLooped() && v.getWantPlay() && !v.getReleased()) {
+                        v.incrementLoopCount();
+                        extractor.seekTo(0L, android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                        codec.flush();
+                        sawInputEOS = false;
+                        sawOutputEOS = false;
+                        v.setPosition(0.0d);
+                    } else {
+                        break;
+                    }
+                }
             }
-            v.setEnded(true);
+            if (!v.getReleased()) {
+                v.setEnded(true);
+                v.setWantPlay(false);
+                v.setLoudness(0.0f);
+                v.setPosition(0.0d);
+            }
             return true;
         } catch (Throwable t) {
             return false;
         } finally {
+            v.setLoudness(0.0f);
             try { if (codec != null) { codec.stop(); codec.release(); } } catch (Throwable ignored) {}
             try { if (extractor != null) extractor.release(); } catch (Throwable ignored) {}
             try { if (track != null) { track.stop(); track.release(); } } catch (Throwable ignored) {}
         }
     }
 
-    private final void setSpeed(MediaPlayer mp, float speed) {
-        if (speed <= 0.0f || Math.abs(speed - 1.0f) < 0.001f) {
+    private final void setSpeed(Voice v, MediaPlayer mp, float speed) {
+        if (speed <= 0.001f) {
+            try {
+                if (mp.isPlaying()) {
+                    mp.pause();
+                }
+            } catch (Exception ignored) {
+            }
+            v.setLoudness(0.0f);
+            return;
+        }
+        float clamped = RangesKt.coerceIn(speed, 0.05f, 8.0f);
+        if (Math.abs(clamped - v.getAppliedSpeed()) <= 0.001f) {
             return;
         }
         try {
-            mp.setPlaybackParams(mp.getPlaybackParams().setSpeed(speed).setPitch(speed));
-        } catch (Exception e) {
+            if (mp.isPlaying()) {
+                mp.setPlaybackParams(mp.getPlaybackParams().setSpeed(clamped).setPitch(clamped));
+                v.setAppliedSpeed(clamped);
+            }
+        } catch (Exception ignored) {
         }
     }
 
     /* JADX INFO: Access modifiers changed from: private */
     public final void apply(Voice v, float l, float r, float speed, boolean loop, boolean restart) {
         MediaPlayer mp = v.getMp();
-        if (mp != null && v.getPrepared()) {
-            try {
-                mp.setVolume(l, r);
-                mp.setLooping(loop);
-                setSpeed(mp, speed);
-                if (restart || !mp.isPlaying()) {
-                    mp.start();
-                    tick(v);
+        if (mp == null || !v.getPrepared() || v.getReleased()) {
+            return;
+        }
+        try {
+            mp.setVolume(l, r);
+            mp.setLooping(false);
+            if (appPaused || speed <= 0.001f) {
+                if (mp.isPlaying()) {
+                    mp.pause();
                 }
-            } catch (Exception e) {
+                v.setLoudness(0.0f);
+                return;
             }
+            if (restart || !mp.isPlaying()) {
+                double pSeek = v.consumePendingSeek();
+                if (pSeek >= 0.0d) {
+                    mp.seekTo((int) (pSeek * 1000.0d));
+                }
+                mp.start();
+                tick(v);
+            }
+            setSpeed(v, mp, speed);
+        } catch (Exception ignored) {
         }
     }
 
     private final void tick(final Voice v) {
-        h.postDelayed(new Runnable() { // from class: com.goydevv.studrblx.audio.AudioEngine.tick.1
-            @Override // java.lang.Runnable
+        if (v.getTicking() || v.getReleased()) {
+            return;
+        }
+        v.setTicking(true);
+        h.postDelayed(new Runnable() {
+            @Override
             public void run() {
                 MediaPlayer mp = v.getMp();
-                if (mp == null) {
+                if (v.getReleased() || mp == null) {
+                    v.setTicking(false);
+                    v.setLoudness(0.0f);
                     return;
                 }
                 try {
-                    if (v.getPrepared()) {
+                    if (v.getPrepared() && mp.isPlaying()) {
                         v.setPosition(((double) mp.getCurrentPosition()) / 1000.0d);
+                        v.setLoudness(Math.min(1000.0f, ((v.getLastL() + v.getLastR()) * 0.5f) * 350.0f));
+                    } else {
+                        v.setLoudness(0.0f);
                     }
-                    if (v.getWantPlay()) {
-                        AudioEngine.h.postDelayed(this, 200L);
+                    if (v.getWantPlay() && !v.getReleased() && !v.getEnded()) {
+                        AudioEngine.h.postDelayed(this, 100L);
+                    } else {
+                        v.setTicking(false);
                     }
                 } catch (Exception e) {
+                    v.setTicking(false);
+                    v.setLoudness(0.0f);
                 }
             }
-        }, 200L);
+        }, 100L);
     }
 
     private final void release(final Voice v) {
+        v.setReleased(true);
         v.setWantPlay(false);
-        h.post(new Runnable() { // from class: com.goydevv.studrblx.audio.AudioEngine$$ExternalSyntheticLambda8
-            @Override // java.lang.Runnable
-            public final void run() {
+        v.setLoudness(0.0f);
+        h.post(new Runnable() {
+            @Override
+            public void run() {
                 AudioEngine.release$lambda$13(v);
             }
         });
@@ -1195,18 +1541,21 @@ public final class AudioEngine {
             if (mp != null) {
                 mp.release();
             }
-        } catch (Exception e) {
+        } catch (Exception ignored) {
         }
         $v.setMp(null);
     }
 
     public final void stopAll() {
         for (Voice v : voices.values()) {
-            Intrinsics.checkNotNull(v);
-            release(v);
+            if (v != null) {
+                release(v);
+            }
         }
         voices.clear();
         missing.clear();
+        transientSounds.clear();
+        abandonAudioFocus();
     }
 
     /* JADX INFO: compiled from: AudioEngine.kt */

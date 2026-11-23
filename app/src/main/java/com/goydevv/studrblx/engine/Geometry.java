@@ -23,6 +23,12 @@ public final class Geometry {
     private static final List<Vector3> ROUND_AXES;
     public static final Geometry INSTANCE = new Geometry();
     private static final float H = 0.5f;
+    private static final ThreadLocal<float[]> SAT_SCRATCH = new ThreadLocal<float[]>() {
+        @Override
+        protected float[] initialValue() {
+            return new float[4];
+        }
+    };
 
     private Geometry() {
     }
@@ -45,6 +51,17 @@ public final class Geometry {
         if (shape == 3) {
             Vector3 n = new Vector3(0.0f, s.getZ(), -s.getY()).getUnit();
             return CollectionsKt.listOf(new Pair[]{TuplesKt.to(Vector3.INSTANCE.getX(), Float.valueOf(hx)), TuplesKt.to(Vector3.INSTANCE.getX().unaryMinus(), Float.valueOf(hx)), TuplesKt.to(Vector3.INSTANCE.getY().unaryMinus(), Float.valueOf(hy)), TuplesKt.to(Vector3.INSTANCE.getZ(), Float.valueOf(hz)), TuplesKt.to(n, Float.valueOf(0.0f))});
+        }
+        if (shape == 4) {
+            Vector3 leftSlopeN = new Vector3(-s.getY(), s.getX(), 0.0f).getUnit();
+            Vector3 backSlopeN = new Vector3(0.0f, s.getZ(), s.getY()).getUnit();
+            return CollectionsKt.listOf(new Pair[]{
+                TuplesKt.to(Vector3.INSTANCE.getX(), Float.valueOf(hx)),
+                TuplesKt.to(Vector3.INSTANCE.getY().unaryMinus(), Float.valueOf(hy)),
+                TuplesKt.to(Vector3.INSTANCE.getZ().unaryMinus(), Float.valueOf(hz)),
+                TuplesKt.to(leftSlopeN, Float.valueOf(0.0f)),
+                TuplesKt.to(backSlopeN, Float.valueOf(0.0f))
+            });
         }
         return listListOf;
     }
@@ -80,6 +97,73 @@ public final class Geometry {
             }
             Vector3 hitLocal = lo.plus(ld.times(t));
             return TuplesKt.to(Float.valueOf(t), cf.vectorToWorld(hitLocal.getUnit()));
+        }
+        if (shape == 2) {
+            float hx = size.getX() * H;
+            float r = Math.min(size.getY(), size.getZ()) * H;
+            float tEnterCyl = -3.4028235E38f;
+            float tExitCyl = Float.MAX_VALUE;
+            Vector3 enterNCyl = Vector3.INSTANCE.getX();
+            if (Math.abs(ld.getX()) < 1.0E-8f) {
+                if (lo.getX() < -hx || lo.getX() > hx) {
+                    return null;
+                }
+            } else {
+                float invDx = 1.0f / ld.getX();
+                float t0 = (-hx - lo.getX()) * invDx;
+                float t1 = (hx - lo.getX()) * invDx;
+                Vector3 n0 = Vector3.INSTANCE.getX().unaryMinus();
+                Vector3 n1 = Vector3.INSTANCE.getX();
+                if (t0 > t1) {
+                    float tmpT = t0;
+                    t0 = t1;
+                    t1 = tmpT;
+                    Vector3 tmpN = n0;
+                    n0 = n1;
+                    n1 = tmpN;
+                }
+                if (t0 > tEnterCyl) {
+                    tEnterCyl = t0;
+                    enterNCyl = n0;
+                }
+                if (t1 < tExitCyl) {
+                    tExitCyl = t1;
+                }
+                if (tEnterCyl > tExitCyl) {
+                    return null;
+                }
+            }
+            float a = (ld.getY() * ld.getY()) + (ld.getZ() * ld.getZ());
+            float b = (lo.getY() * ld.getY()) + (lo.getZ() * ld.getZ());
+            float c = (lo.getY() * lo.getY()) + (lo.getZ() * lo.getZ()) - (r * r);
+            if (a < 1.0E-12f) {
+                if (c > 0.0f) {
+                    return null;
+                }
+            } else {
+                float disc = (b * b) - (a * c);
+                if (disc < 0.0f) {
+                    return null;
+                }
+                float sq = (float) Math.sqrt(disc);
+                float c0 = (-b - sq) / a;
+                float c1 = (-b + sq) / a;
+                if (c0 > tEnterCyl) {
+                    tEnterCyl = c0;
+                    enterNCyl = new Vector3(0.0f, lo.getY() + (ld.getY() * c0), lo.getZ() + (ld.getZ() * c0)).getUnit();
+                }
+                if (c1 < tExitCyl) {
+                    tExitCyl = c1;
+                }
+                if (tEnterCyl > tExitCyl) {
+                    return null;
+                }
+            }
+            if (tExitCyl < 0.0f) {
+                return null;
+            }
+            float tHit = tEnterCyl >= 0.0f ? tEnterCyl : 0.0f;
+            return TuplesKt.to(Float.valueOf(tHit), cf.vectorToWorld(enterNCyl));
         }
         float tEnter = -3.4028235E38f;
         float tExit = Float.MAX_VALUE;
@@ -153,6 +237,25 @@ public final class Geometry {
         return worldAabb(PartData.INSTANCE.cframe(p), PartData.INSTANCE.size(p));
     }
 
+    public final boolean partAabbOverlap(Instance p, Vector3 a, Vector3 b, float pad) {
+        Intrinsics.checkNotNullParameter(p, "p");
+        Intrinsics.checkNotNullParameter(a, "a");
+        Intrinsics.checkNotNullParameter(b, "b");
+        CFrame cf = PartData.INSTANCE.cframe(p);
+        Vector3 size = PartData.INSTANCE.size(p);
+        float hx = size.getX() * H;
+        float hy = size.getY() * H;
+        float hz = size.getZ() * H;
+        float ex = (Math.abs(cf.getR00()) * hx) + (Math.abs(cf.getR01()) * hy) + (Math.abs(cf.getR02()) * hz);
+        float ey = (Math.abs(cf.getR10()) * hx) + (Math.abs(cf.getR11()) * hy) + (Math.abs(cf.getR12()) * hz);
+        float ez = (Math.abs(cf.getR20()) * hx) + (Math.abs(cf.getR21()) * hy) + (Math.abs(cf.getR22()) * hz);
+        float px = cf.getX();
+        float py = cf.getY();
+        float pz = cf.getZ();
+        return a.getX() <= px + ex + pad && a.getY() <= py + ey + pad && a.getZ() <= pz + ez + pad
+            && b.getX() >= px - ex - pad && b.getY() >= py - ey - pad && b.getZ() >= pz - ez - pad;
+    }
+
     public final Pair<Vector3, Vector3> boundsOf(List<? extends Instance> parts) {
         Intrinsics.checkNotNullParameter(parts, "parts");
         if (parts.isEmpty()) {
@@ -200,13 +303,8 @@ public final class Geometry {
         Vector3 h = s.times(H);
         int i = 0;
         List ax = CollectionsKt.listOf(new Vector3[]{cf.getRightVector(), cf.getUpVector(), cf.getBackVector()});
-        Object obj = part.get("shape");
-        if (obj == null) {
-            obj = part.get("Shape");
-        }
-        EnumValue enumValue = obj instanceof EnumValue ? (EnumValue) obj : null;
-        Integer numValueOf = enumValue != null ? Integer.valueOf(enumValue.getValue()) : null;
-        if (numValueOf != null && numValueOf.intValue() == 0) {
+        int shape = PartData.INSTANCE.shape(part);
+        if (shape == 0) {
             Vector3 position = cf.getPosition();
             float fMin = Math.min(s.getX(), Math.min(s.getY(), s.getZ())) * H;
             Iterable iterable = ROUND_AXES;
@@ -217,8 +315,8 @@ public final class Geometry {
             }
             return new SphereShape(position, fMin, (List) arrayList);
         }
-        if (numValueOf == null || numValueOf.intValue() != 2) {
-            if (PartData.INSTANCE.shape(part) == 3) {
+        if (shape != 2) {
+            if (shape == 3) {
                 Iterable local = CollectionsKt.listOf(new Vector3[]{new Vector3(-h.getX(), -h.getY(), -h.getZ()), new Vector3(h.getX(), -h.getY(), -h.getZ()), new Vector3(-h.getX(), -h.getY(), h.getZ()), new Vector3(h.getX(), -h.getY(), h.getZ()), new Vector3(-h.getX(), h.getY(), h.getZ()), new Vector3(h.getX(), h.getY(), h.getZ())});
                 Vector3 slopeN = cf.vectorToWorld(new Vector3(0.0f, s.getZ(), -s.getY()).getUnit());
                 Vector3 slopeD = cf.vectorToWorld(new Vector3(0.0f, s.getY(), s.getZ()).getUnit());
@@ -229,6 +327,33 @@ public final class Geometry {
                     arrayList2.add(cf.times((Vector3) it2.next()));
                 }
                 return new ConvexShape((List) arrayList2, CollectionsKt.plus((Collection<? extends Vector3>) ax, slopeN), CollectionsKt.plus((Collection<? extends Vector3>) ax, slopeD));
+            } else if (shape == 4) {
+                float hx = h.getX();
+                float hy = h.getY();
+                float hz = h.getZ();
+                List<Vector3> cwVerts = CollectionsKt.listOf(new Vector3[]{
+                    cf.times(new Vector3(-hx, -hy, -hz)),
+                    cf.times(new Vector3(hx, -hy, -hz)),
+                    cf.times(new Vector3(hx, -hy, hz)),
+                    cf.times(new Vector3(-hx, -hy, hz)),
+                    cf.times(new Vector3(hx, hy, -hz))
+                });
+                List<Vector3> cwNormals = CollectionsKt.listOf(new Vector3[]{
+                    cf.getRightVector(),
+                    cf.getUpVector(),
+                    cf.getBackVector(),
+                    cf.vectorToWorld(new Vector3(-s.getY(), s.getX(), 0.0f).getUnit()),
+                    cf.vectorToWorld(new Vector3(0.0f, s.getZ(), s.getY()).getUnit())
+                });
+                List<Vector3> cwEdges = CollectionsKt.listOf(new Vector3[]{
+                    cf.getRightVector(),
+                    cf.getUpVector(),
+                    cf.getBackVector(),
+                    cf.vectorToWorld(new Vector3(s.getX(), s.getY(), 0.0f).getUnit()),
+                    cf.vectorToWorld(new Vector3(0.0f, s.getY(), -s.getZ()).getUnit()),
+                    cf.vectorToWorld(new Vector3(s.getX(), s.getY(), -s.getZ()).getUnit())
+                });
+                return new ConvexShape(cwVerts, cwNormals, cwEdges);
             }
             return new ConvexShape(corners(cf, s), ax, ax);
         }
@@ -290,44 +415,107 @@ public final class Geometry {
     public final Vector3 sat(ConvexShape a, ConvexShape b) {
         Intrinsics.checkNotNullParameter(a, "a");
         Intrinsics.checkNotNullParameter(b, "b");
-        ArrayList axes = new ArrayList(a.getNormals().size() + b.getNormals().size() + 16);
-        axes.addAll(a.getNormals());
-        axes.addAll(b.getNormals());
-        for (Vector3 ea : a.getEdges()) {
-            for (Vector3 eb : b.getEdges()) {
-                Vector3 c = ea.cross(eb);
-                if (c.getMagnitude() > 1.0E-4f) {
-                    axes.add(c.getUnit());
-                }
-            }
-        }
+        float[] proj = SAT_SCRATCH.get();
         float best = Float.MAX_VALUE;
-        Vector3 bestAxis = Vector3.INSTANCE.getY();
-        Iterator it = axes.iterator();
-        Intrinsics.checkNotNullExpressionValue(it, "iterator(...)");
-        while (it.hasNext()) {
-            Object next = it.next();
-            Intrinsics.checkNotNullExpressionValue(next, "next(...)");
-            Vector3 ax = (Vector3) next;
-            Pair<Float, Float> pairProject = a.project(ax);
-            float a0 = pairProject.component1().floatValue();
-            float a1 = pairProject.component2().floatValue();
-            Pair<Float, Float> pairProject2 = b.project(ax);
-            float b0 = pairProject2.component1().floatValue();
-            float b1 = pairProject2.component2().floatValue();
+        float bestX = 0.0f;
+        float bestY = 1.0f;
+        float bestZ = 0.0f;
+        List<Vector3> aNormals = a.getNormals();
+        for (int i = 0, n = aNormals.size(); i < n; i++) {
+            Vector3 ax = aNormals.get(i);
+            float axx = ax.getX();
+            float axy = ax.getY();
+            float axz = ax.getZ();
+            a.project(axx, axy, axz, proj);
+            float a0 = proj[0];
+            float a1 = proj[1];
+            b.project(axx, axy, axz, proj);
+            float b0 = proj[0];
+            float b1 = proj[1];
             float o = Math.min(a1 - b0, b1 - a0);
             if (o <= 0.0f) {
                 return null;
             }
             if (o < best) {
                 best = o;
-                bestAxis = ax;
+                bestX = axx;
+                bestY = axy;
+                bestZ = axz;
             }
         }
-        if (a.getCenter().minus(b.getCenter()).dot(bestAxis) < 0.0f) {
-            bestAxis = bestAxis.unaryMinus();
+        List<Vector3> bNormals = b.getNormals();
+        for (int i = 0, n = bNormals.size(); i < n; i++) {
+            Vector3 ax = bNormals.get(i);
+            float axx = ax.getX();
+            float axy = ax.getY();
+            float axz = ax.getZ();
+            a.project(axx, axy, axz, proj);
+            float a0 = proj[0];
+            float a1 = proj[1];
+            b.project(axx, axy, axz, proj);
+            float b0 = proj[0];
+            float b1 = proj[1];
+            float o = Math.min(a1 - b0, b1 - a0);
+            if (o <= 0.0f) {
+                return null;
+            }
+            if (o < best) {
+                best = o;
+                bestX = axx;
+                bestY = axy;
+                bestZ = axz;
+            }
         }
-        return bestAxis.times(best);
+        List<Vector3> aEdges = a.getEdges();
+        List<Vector3> bEdges = b.getEdges();
+        int na = aEdges.size();
+        int nb = bEdges.size();
+        for (int i = 0; i < na; i++) {
+            Vector3 ea = aEdges.get(i);
+            float eax = ea.getX();
+            float eay = ea.getY();
+            float eaz = ea.getZ();
+            for (int j = 0; j < nb; j++) {
+                Vector3 eb = bEdges.get(j);
+                float ebx = eb.getX();
+                float eby = eb.getY();
+                float ebz = eb.getZ();
+                float cx = (eay * ebz) - (eaz * eby);
+                float cy = (eaz * ebx) - (eax * ebz);
+                float cz = (eax * eby) - (eay * ebx);
+                float lenSq = (cx * cx) + (cy * cy) + (cz * cz);
+                if (lenSq > 1.0E-8f) {
+                    float invLen = 1.0f / ((float) Math.sqrt(lenSq));
+                    float axx = cx * invLen;
+                    float axy = cy * invLen;
+                    float axz = cz * invLen;
+                    a.project(axx, axy, axz, proj);
+                    float a0 = proj[0];
+                    float a1 = proj[1];
+                    b.project(axx, axy, axz, proj);
+                    float b0 = proj[0];
+                    float b1 = proj[1];
+                    float o = Math.min(a1 - b0, b1 - a0);
+                    if (o <= 0.0f) {
+                        return null;
+                    }
+                    if (o < best) {
+                        best = o;
+                        bestX = axx;
+                        bestY = axy;
+                        bestZ = axz;
+                    }
+                }
+            }
+        }
+        Vector3 ca = a.getCenter();
+        Vector3 cb = b.getCenter();
+        if (((ca.getX() - cb.getX()) * bestX) + ((ca.getY() - cb.getY()) * bestY) + ((ca.getZ() - cb.getZ()) * bestZ) < 0.0f) {
+            bestX = -bestX;
+            bestY = -bestY;
+            bestZ = -bestZ;
+        }
+        return new Vector3(bestX * best, bestY * best, bestZ * best);
     }
 
     public static /* synthetic */ boolean aabbOverlap$default(Geometry geometry, Vector3 vector3, Vector3 vector4, Vector3 vector5, Vector3 vector6, float f, int i, Object obj) {

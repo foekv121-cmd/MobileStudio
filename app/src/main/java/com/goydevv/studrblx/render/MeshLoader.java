@@ -6,6 +6,7 @@ import com.goydevv.studrblx.format.RbxFile;
 import com.goydevv.studrblx.model.Instance;
 import com.goydevv.studrblx.model.PartData;
 import com.goydevv.studrblx.net.AssetFetcher;
+import java.io.File;
 import java.util.Collection;
 import java.util.List;
 import java.util.Iterator;
@@ -15,6 +16,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import kotlin.Unit;
 import kotlin.collections.CollectionsKt;
+import kotlin.io.FilesKt;
 import kotlin.jvm.functions.Function1;
 import kotlin.text.StringsKt;
 
@@ -49,9 +51,10 @@ public final class MeshLoader {
         if (bad.contains(Long.valueOf(id)) || !pending.add(Long.valueOf(id))) {
             return null;
         }
-        final byte[] bytes = AssetFetcher.INSTANCE.request(id);
-        if (bytes == null) {
+        final File cached = AssetFetcher.INSTANCE.cachedFile(id);
+        if (cached == null) {
             pending.remove(Long.valueOf(id));
+            AssetFetcher.INSTANCE.prefetch(id);
             if (!waiting) {
                 waiting = true;
                 AssetFetcher.INSTANCE.getListeners().add(new Function1() { // from class: com.goydevv.studrblx.render.MeshLoader$$ExternalSyntheticLambda0
@@ -66,6 +69,13 @@ public final class MeshLoader {
         pool.execute(new Runnable() { // from class: com.goydevv.studrblx.render.MeshLoader$$ExternalSyntheticLambda1
             @Override // java.lang.Runnable
             public final void run() {
+                byte[] bytes;
+                try {
+                    bytes = FilesKt.readBytes(cached);
+                } catch (Exception e) {
+                    pending.remove(Long.valueOf(id));
+                    return;
+                }
                 MeshLoader.get$lambda$3(id, bytes);
             }
         });

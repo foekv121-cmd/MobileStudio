@@ -62,4 +62,23 @@ public class ConvexShape {
         }
         return TuplesKt.to(Float.valueOf(mn), Float.valueOf(mx));
     }
+
+    public void project(float ax, float ay, float az, float[] out) {
+        float mn = Float.MAX_VALUE;
+        float mx = -3.4028235E38f;
+        List<Vector3> vs = this.verts;
+        int n = vs.size();
+        for (int i = 0; i < n; i++) {
+            Vector3 v = vs.get(i);
+            float d = (v.getX() * ax) + (v.getY() * ay) + (v.getZ() * az);
+            if (d < mn) {
+                mn = d;
+            }
+            if (d > mx) {
+                mx = d;
+            }
+        }
+        out[0] = mn;
+        out[1] = mx;
+    }
 }

@@ -36,6 +36,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -98,12 +99,14 @@ public final class PlaySession implements TreeListener {
     private final ArrayList<ChatLine> chatLines;
     private volatile int chatVersion;
     private boolean climbing;
-    private float bodyPitch;
-    private float bodyRoll;
-    private float prevRenderFacing;
     private Vector3 groundNormal = new Vector3(0.0f, 1.0f, 0.0f);
-    private Vector3 wallBumpNormal = new Vector3(0.0f, 0.0f, 0.0f);
-    private float wallBumpDecay;
+    private float baseCharMinY = -3.0f;
+    private float baseHipHeight = 0.0f;
+    private Instance floorPart;
+    private CFrame floorLastCf;
+    private float lastRunningSpeed = -1.0f;
+    private final HashSet<String> disabledStates = new HashSet<>();
+    private static final int MATERIAL_AIR = 1792;
     private boolean controlsEnabled;
     private boolean coreBackpack;
     private boolean coreChat;
@@ -1386,6 +1389,33 @@ public final class PlaySession implements TreeListener {
         Intrinsics.checkNotNull(root);
         Instance hum = model.findFirstChildOfClass("Humanoid");
         Intrinsics.checkNotNull(hum);
+        Instance spCfg = this.dm.findService("StarterPlayer");
+        if (spCfg != null) {
+            Object spWs = spCfg.get("CharacterWalkSpeed");
+            if (spWs instanceof Number) {
+                hum.set("WalkSpeed", Float.valueOf(((Number) spWs).floatValue()), false);
+            }
+            Object spJp = spCfg.get("CharacterJumpPower");
+            if (spJp instanceof Number) {
+                hum.set("JumpPower", Float.valueOf(((Number) spJp).floatValue()), false);
+            }
+            Object spJh = spCfg.get("CharacterJumpHeight");
+            if (spJh instanceof Number) {
+                hum.set("JumpHeight", Float.valueOf(((Number) spJh).floatValue()), false);
+            }
+            Object spUjp = spCfg.get("CharacterUseJumpPower");
+            if (spUjp instanceof Boolean) {
+                hum.set("UseJumpPower", spUjp, false);
+            }
+            Object spMsa = spCfg.get("CharacterMaxSlopeAngle");
+            if (spMsa instanceof Number) {
+                hum.set("MaxSlopeAngle", Float.valueOf(((Number) spMsa).floatValue()), false);
+            }
+            Object spAj = spCfg.get("AutoJumpEnabled");
+            if (spAj instanceof Boolean) {
+                hum.set("AutoJumpEnabled", spAj, false);
+            }
+        }
         model.set("PrimaryPart", root, false);
         Object obj = hum.get("RigType");
         EnumValue enumValue = obj instanceof EnumValue ? (EnumValue) obj : null;
@@ -1416,6 +1446,9 @@ public final class PlaySession implements TreeListener {
         Instance p3 = p;
         this.charMinY = minY;
         this.charMaxY = maxY;
+        this.baseCharMinY = minY;
+        Object hhSpawn = hum.get("HipHeight");
+        this.baseHipHeight = (hhSpawn instanceof Number && ((Number) hhSpawn).floatValue() >= 0.0f) ? ((Number) hhSpawn).floatValue() : 0.0f;
         this.charHalfXZ = RangesKt.coerceAtMost(half, 1.2f);
         buildJoints(model, root);
         Iterable iterableDescendants$default = Instance.descendants$default(this.dm.getWorkspace(), null, 1, null);
@@ -1493,9 +1526,15 @@ public final class PlaySession implements TreeListener {
         this.vel = Vector3.INSTANCE.getZERO();
         this.dead = false;
         this.emote = null;
+        this.grounded = false;
+        this.floorPart = null;
+        this.floorLastCf = null;
+        this.lastRunningSpeed = -1.0f;
+        this.disabledStates.clear();
         this.hrp = root;
         this.humanoid = hum;
         this.character = model;
+        setFloorMaterial(MATERIAL_AIR);
         writeCharacter(0.0f);
         Instance instanceFindService3 = this.dm.findService("StarterPlayer");
         if (instanceFindService3 != null && (instanceFindFirstChild$default = Instance.findFirstChild$default(instanceFindService3, "StarterCharacterScripts", false, 2, null)) != null && (children = instanceFindFirstChild$default.getChildren()) != null) {
@@ -1932,8 +1971,11 @@ public final class PlaySession implements TreeListener {
     }
 
     private final String pose() {
-        if (this.seated != null) {
+        if (this.seated != null || (this.humanoid != null && Intrinsics.areEqual(this.humanoid.get("Sit"), Boolean.TRUE))) {
             return "Seated";
+        }
+        if (this.humanoid != null && Intrinsics.areEqual(this.humanoid.get("PlatformStand"), Boolean.TRUE)) {
+            return "FreeFall";
         }
         if (this.climbing) {
             return "Climbing";
@@ -3139,41 +3181,8 @@ public final class PlaySession implements TreeListener {
         animate(dt);
         Instance seat = this.seated;
         if (seat == null) {
-            // Roblox-style dynamic body tilt: slope alignment, run lean, turn bank, and collision bump yield
-            float fwdX = (float) (-Math.sin(this.renderFacing));
-            float fwdZ = (float) (-Math.cos(this.renderFacing));
-            float rgtX = (float) Math.cos(this.renderFacing);
-            float rgtZ = (float) (-Math.sin(this.renderFacing));
-            float tPitch = 0.0f;
-            float tRoll = 0.0f;
-            if (this.climbing) {
-                tPitch = 0.08f;
-            } else {
-                float fwdSpd = (this.vel.getX() * fwdX) + (this.vel.getZ() * fwdZ);
-                float sideSpd = (this.vel.getX() * rgtX) + (this.vel.getZ() * rgtZ);
-                tPitch += RangesKt.coerceIn(-fwdSpd * 0.0055f, -0.11f, 0.08f);
-                float yawDelta = wrapAngle(this.renderFacing - this.prevRenderFacing);
-                float turnRate = dt > 1.0E-4f ? RangesKt.coerceIn(yawDelta / dt, -8.0f, 8.0f) : 0.0f;
-                tRoll += RangesKt.coerceIn((sideSpd * 0.004f) - (turnRate * 0.018f), -0.13f, 0.13f);
-                if (this.grounded && this.groundNormal != null) {
-                    float gnFwd = (this.groundNormal.getX() * fwdX) + (this.groundNormal.getZ() * fwdZ);
-                    float gnRgt = (this.groundNormal.getX() * rgtX) + (this.groundNormal.getZ() * rgtZ);
-                    tPitch += RangesKt.coerceIn(gnFwd * 0.28f, -0.18f, 0.18f);
-                    tRoll += RangesKt.coerceIn(-gnRgt * 0.28f, -0.18f, 0.18f);
-                }
-                if (this.wallBumpDecay > 0.001f) {
-                    float wbFwd = (this.wallBumpNormal.getX() * fwdX) + (this.wallBumpNormal.getZ() * fwdZ);
-                    float wbRgt = (this.wallBumpNormal.getX() * rgtX) + (this.wallBumpNormal.getZ() * rgtZ);
-                    tPitch += RangesKt.coerceIn(wbFwd * 0.16f * this.wallBumpDecay, -0.15f, 0.15f);
-                    tRoll += RangesKt.coerceIn(-wbRgt * 0.16f * this.wallBumpDecay, -0.15f, 0.15f);
-                    this.wallBumpDecay = Math.max(0.0f, this.wallBumpDecay - (dt * 6.5f));
-                }
-            }
-            this.prevRenderFacing = this.renderFacing;
-            float tiltBlend = RangesKt.coerceIn(1.0f - ((float) Math.exp((-12.0f) * dt)), 0.0f, 1.0f);
-            this.bodyPitch += (tPitch - this.bodyPitch) * tiltBlend;
-            this.bodyRoll += (tRoll - this.bodyRoll) * tiltBlend;
-            scf = CFrame.INSTANCE.at(this.pos).times(CFrame.INSTANCE.ry(this.renderFacing)).times(CFrame.INSTANCE.rx(this.bodyPitch)).times(CFrame.INSTANCE.rz(this.bodyRoll));
+            // Real Roblox Humanoid upright gyro (BalanceMaxTorque): stays vertical on flat/slopes
+            scf = CFrame.INSTANCE.at(this.pos).times(CFrame.INSTANCE.ry(this.renderFacing));
         } else {
             CFrame scf2 = PartData.INSTANCE.cframe(seat);
             Vector3 ss = PartData.INSTANCE.size(seat);
@@ -3604,14 +3613,156 @@ public final class PlaySession implements TreeListener {
                 }
             }
         }
-        Iterable iterableFilterNotNull = CollectionsKt.filterNotNull(hits);
-        Collection arrayList = new ArrayList(CollectionsKt.collectionSizeOrDefault(iterableFilterNotNull, 10));
-        Iterator it5 = iterableFilterNotNull.iterator();
-        while (it5.hasNext()) {
-            arrayList.add(Float.valueOf(((RayHit) it5.next()).getT()));
+        float minT = Float.MAX_VALUE;
+        float maxT = -3.4028235E38f;
+        for (RayHit rh : hits) {
+            if (rh != null) {
+                float t = rh.getT();
+                if (t < minT) {
+                    minT = t;
+                }
+                if (t > maxT) {
+                    maxT = t;
+                }
+            }
         }
-        List ts = (List) arrayList;
-        return CollectionsKt.maxOrThrow((Iterable<Double>) ts) - CollectionsKt.minOrThrow((Iterable<Double>) ts) <= 0.7f && lastHit >= hits.size() / 2 && gaps >= 1 && ((float) maxRun) * 0.4f <= 2.4f && hitCount >= 2 && hitCount < hits.size();
+        return (maxT - minT) <= 0.7f && lastHit >= hits.size() / 2 && gaps >= 1 && ((float) maxRun) * 0.4f <= 2.4f && hitCount >= 2 && hitCount < hits.size();
+    }
+
+    private final float minSlopeNy() {
+        float maxSlopeDeg = 89.0f;
+        if (this.humanoid != null) {
+            Object obj = this.humanoid.get("MaxSlopeAngle");
+            if (obj instanceof Number) {
+                maxSlopeDeg = RangesKt.coerceIn(((Number) obj).floatValue(), 0.0f, 89.0f);
+            }
+        }
+        return (float) Math.cos(Math.toRadians((double) maxSlopeDeg));
+    }
+
+    private final float computeJumpVelocity(Instance hum) {
+        if (hum != null && Intrinsics.areEqual(hum.get("UseJumpPower"), (Object) false)) {
+            float gravity = getGravity();
+            Object jhObj = hum.get("JumpHeight");
+            float jh = jhObj instanceof Number ? ((Number) jhObj).floatValue() : 7.2f;
+            float prod = 2.0f * gravity * jh;
+            return prod > 0.0f ? (float) Math.sqrt((double) prod) : 0.0f;
+        }
+        Object jpObj = hum != null ? hum.get("JumpPower") : null;
+        float jp = jpObj instanceof Number ? ((Number) jpObj).floatValue() : 50.0f;
+        return Math.max(0.0f, jp);
+    }
+
+    private final void setFloorMaterial(int materialEnum) {
+        Instance hum = this.humanoid;
+        if (hum == null) {
+            return;
+        }
+        Object cur = hum.get("FloorMaterial");
+        if (cur instanceof EnumValue && ((EnumValue) cur).getValue() == materialEnum) {
+            return;
+        }
+        Instance.set$default(hum, "FloorMaterial", new EnumValue(materialEnum), false, 4, null);
+    }
+
+    public final boolean isStateEnabled(Instance h, String stateName) {
+        if (stateName == null) {
+            return true;
+        }
+        if (h == null || h == this.humanoid) {
+            return !this.disabledStates.contains(stateName);
+        }
+        Object v = h.getAttributes().get("__stateEnabled_" + stateName);
+        return !(v instanceof Boolean) || ((Boolean) v).booleanValue();
+    }
+
+    public final void setStateEnabled(Instance h, String stateName, boolean enabled) {
+        if (stateName == null) {
+            return;
+        }
+        if (h == null || h == this.humanoid) {
+            if (enabled) {
+                this.disabledStates.remove(stateName);
+            } else {
+                this.disabledStates.add(stateName);
+            }
+        }
+        if (h != null) {
+            h.getAttributes().put("__stateEnabled_" + stateName, Boolean.valueOf(enabled));
+        }
+    }
+
+    public final void changeState(Instance h, String stateName) {
+        if (stateName == null) {
+            return;
+        }
+        LinkedHashMap<String, Integer> stMap = Enums.INSTANCE.getTypes().get("HumanoidStateType");
+        Integer stValObj = stMap != null ? stMap.get(stateName) : null;
+        int stVal = stValObj != null ? stValObj.intValue() : 8;
+        if (h != null && h != this.humanoid) {
+            Object prevObj = h.getAttributes().get("__state");
+            String prevName = prevObj instanceof String ? (String) prevObj : "Running";
+            if (!Intrinsics.areEqual(prevName, stateName)) {
+                Integer oldValObj = stMap != null ? stMap.get(prevName) : null;
+                int oldVal = oldValObj != null ? oldValObj.intValue() : 8;
+                h.getAttributes().put("__state", stateName);
+                this.rt.fire(h, "StateChanged", LuaTypes.INSTANCE.wrap(new EnumItemV("HumanoidStateType", prevName, oldVal)), LuaTypes.INSTANCE.wrap(new EnumItemV("HumanoidStateType", stateName, stVal)));
+            }
+            return;
+        }
+        Instance hum = this.humanoid;
+        if (hum == null) {
+            return;
+        }
+        if ("Jumping".equals(stateName)) {
+            if (this.seated != null) {
+                leaveSeat(true);
+                return;
+            }
+            float jv = computeJumpVelocity(hum);
+            this.vel = new Vector3(this.vel.getX(), jv, this.vel.getZ());
+            this.grounded = false;
+            this.climbing = false;
+            this.jumpAnimTime = 0.3f;
+            Instance.set$default(hum, "PlatformStand", Boolean.FALSE, false, 4, null);
+            Instance.set$default(hum, "Sit", Boolean.FALSE, false, 4, null);
+        } else if ("Seated".equals(stateName)) {
+            this.climbing = false;
+            this.grounded = false;
+            this.vel = Vector3.INSTANCE.getZERO();
+            Instance.set$default(hum, "Sit", Boolean.TRUE, false, 4, null);
+            Instance.set$default(hum, "PlatformStand", Boolean.FALSE, false, 4, null);
+        } else if ("PlatformStanding".equals(stateName)) {
+            this.climbing = false;
+            Instance.set$default(hum, "PlatformStand", Boolean.TRUE, false, 4, null);
+            Instance.set$default(hum, "Sit", Boolean.FALSE, false, 4, null);
+        } else if ("Climbing".equals(stateName)) {
+            if (this.seated != null) {
+                leaveSeat(false);
+            }
+            this.climbing = true;
+            this.grounded = false;
+            Instance.set$default(hum, "PlatformStand", Boolean.FALSE, false, 4, null);
+            Instance.set$default(hum, "Sit", Boolean.FALSE, false, 4, null);
+        } else if ("Dead".equals(stateName)) {
+            Instance.set$default(hum, hum.getProps().containsKey("Health") ? "Health" : "Health_XML", Float.valueOf(0.0f), false, 4, null);
+        } else if ("Freefall".equals(stateName)) {
+            if (this.seated != null) {
+                leaveSeat(false);
+            }
+            this.climbing = false;
+            this.grounded = false;
+            Instance.set$default(hum, "PlatformStand", Boolean.FALSE, false, 4, null);
+            Instance.set$default(hum, "Sit", Boolean.FALSE, false, 4, null);
+        } else {
+            if (this.seated != null) {
+                leaveSeat(false);
+            }
+            this.climbing = false;
+            Instance.set$default(hum, "PlatformStand", Boolean.FALSE, false, 4, null);
+            Instance.set$default(hum, "Sit", Boolean.FALSE, false, 4, null);
+        }
+        setState(stateName, stVal);
     }
 
     private final void setState(String name, int value) {
@@ -3648,13 +3799,19 @@ public final class PlaySession implements TreeListener {
         }
         if (jump) {
             Vector3 f = facingVec();
-            this.vel = new Vector3(f.getX() * 4.0f, 45.0f, f.getZ() * 4.0f);
+            float jv = computeJumpVelocity(this.humanoid);
+            this.vel = new Vector3(f.getX() * 4.0f, jv, f.getZ() * 4.0f);
             this.pos = this.pos.plus(new Vector3(0.0f, 0.5f, 0.0f));
+            setState("Jumping", 3);
+        } else if (!this.dead) {
+            setState(this.grounded ? "Running" : "Freefall", this.grounded ? 8 : 5);
         }
-        setState("Jumping", 3);
     }
 
     private final void trySit(float dt) {
+        if (!isStateEnabled(this.humanoid, "Seated")) {
+            return;
+        }
         if (this.seated != null || this.seatCooldown > 0.0f || this.dead) {
             this.seatCooldown -= dt;
             return;
@@ -3747,24 +3904,38 @@ public final class PlaySession implements TreeListener {
                 this.renderFacing = this.facing;
             }
         }
+        float rootHalfY = PartData.INSTANCE.size(instance2).getY() * 0.5f;
+        Object hhObj = instance.get("HipHeight");
+        if (hhObj instanceof Number) {
+            float hh = Math.max(0.0f, ((Number) hhObj).floatValue());
+            float desiredMinY = Math.min(this.baseCharMinY - (hh - this.baseHipHeight), -rootHalfY);
+            float deltaMinY = desiredMinY - this.charMinY;
+            if (Math.abs(deltaMinY) > 1.0E-4f) {
+                this.charMinY = desiredMinY;
+                if (this.grounded) {
+                    this.pos = new Vector3(this.pos.getX(), this.pos.getY() - deltaMinY, this.pos.getZ());
+                }
+            }
+        }
         if (Intrinsics.areEqual(instance.get("Sit"), (Object) false) && this.seated != null) {
             leaveSeat(false);
+        }
+        boolean platformStand = Intrinsics.areEqual(instance.get("PlatformStand"), (Object) true);
+        if (Intrinsics.areEqual(instance.get("Sit"), (Object) true) && this.seated == null) {
+            setState("Seated", 13);
+            if (this.jumpRequested) {
+                Instance.set$default(instance, "Sit", false, false, 4, null);
+            } else {
+                this.vel = Vector3.INSTANCE.getZERO();
+                writeCharacter(dt);
+                return;
+            }
         }
         Object obj = instance.get("WalkSpeed");
         Number number = obj instanceof Number ? (Number) obj : null;
         float fFloatValue2 = number != null ? number.floatValue() : 16.0f;
         float gravity = getGravity();
-        if (Intrinsics.areEqual(instance.get("UseJumpPower"), (Object) false)) {
-            float f3 = gravity * 2.0f;
-            Object obj2 = instance.get("JumpHeight");
-            Number number2 = obj2 instanceof Number ? (Number) obj2 : null;
-            fFloatValue = (float) Math.sqrt(f3 * (number2 != null ? number2.floatValue() : 7.2f));
-        } else {
-            Object obj3 = instance.get("JumpPower");
-            Number number3 = obj3 instanceof Number ? (Number) obj3 : null;
-            fFloatValue = number3 != null ? number3.floatValue() : 50.0f;
-        }
-        float f4 = fFloatValue;
+        float f4 = computeJumpVelocity(instance);
         Vector3 vector3 = new Vector3(-((float) Math.sin(this.camYaw)), 0.0f, -((float) Math.cos(this.camYaw)));
         Vector3 vector4 = new Vector3((float) Math.cos(this.camYaw), 0.0f, -((float) Math.sin(this.camYaw)));
         Ref.ObjectRef objectRef = new Ref.ObjectRef();
@@ -3798,6 +3969,12 @@ public final class PlaySession implements TreeListener {
         } else {
             f = 0.05f;
         }
+        if (platformStand) {
+            objectRef.element = Vector3.INSTANCE.getZERO();
+            this.jumpRequested = false;
+            this.climbing = false;
+            setState("PlatformStanding", 14);
+        }
         this.lastDir = (Vector3) objectRef.element;
         if (this.seated != null) {
             if (this.jumpRequested) {
@@ -3807,17 +3984,42 @@ public final class PlaySession implements TreeListener {
                 return;
             }
         }
-        List<RayHit> listFrontHits = (this.climbing || ((Vector3) objectRef.element).getMagnitude() > 0.1f) ? frontHits() : CollectionsKt.emptyList();
+        if (this.grounded && this.floorPart != null && !this.climbing && this.seated == null) {
+            Body floorBody = this.bodyOf.get(this.floorPart);
+            if (this.floorLastCf != null) {
+                CFrame curFloorCf = PartData.INSTANCE.cframe(this.floorPart);
+                Vector3 carryDelta = curFloorCf.getPosition().minus(this.floorLastCf.getPosition());
+                if (carryDelta.getMagnitude() > 1.0E-5f && carryDelta.getMagnitude() < 20.0f) {
+                    this.pos = this.pos.plus(carryDelta);
+                } else if (floorBody != null) {
+                    Vector3 bv = floorBody.getVel();
+                    this.pos = this.pos.plus(new Vector3(bv.getX() * dt, 0.0f, bv.getZ() * dt));
+                }
+            }
+            if (floorBody == null) {
+                Object convObj = this.floorPart.get("AssemblyLinearVelocity");
+                if (!(convObj instanceof Vector3)) {
+                    convObj = this.floorPart.get("Velocity");
+                }
+                if (convObj instanceof Vector3) {
+                    Vector3 cv = (Vector3) convObj;
+                    if (Math.abs(cv.getX()) > 1.0E-4f || Math.abs(cv.getZ()) > 1.0E-4f) {
+                        this.pos = this.pos.plus(new Vector3(cv.getX() * dt, 0.0f, cv.getZ() * dt));
+                    }
+                }
+            }
+        }
+        List<RayHit> listFrontHits = (!platformStand && (this.climbing || ((Vector3) objectRef.element).getMagnitude() > 0.1f)) ? frontHits() : CollectionsKt.emptyList();
         Vector3 vector3FacingVec = facingVec();
-        boolean z2 = (((Vector3) objectRef.element).getMagnitude() <= 0.1f || ((Vector3) objectRef.element).getUnit().dot(vector3FacingVec) <= 0.3f) ? false : true;
+        boolean z2 = !platformStand && (((Vector3) objectRef.element).getMagnitude() > 0.1f && ((Vector3) objectRef.element).getUnit().dot(vector3FacingVec) > 0.3f);
         boolean ladderKicked = false;
         if (!this.climbing) {
             f2 = gravity;
-            if (z2 && canClimb(listFrontHits, false) && (this.grounded || this.vel.getY() < 5.0f)) {
+            if (z2 && isStateEnabled(instance, "Climbing") && canClimb(listFrontHits, false) && (this.grounded || this.vel.getY() < 5.0f)) {
                 this.climbing = true;
                 setState("Climbing", 12);
             }
-        } else if (this.jumpRequested) {
+        } else if (this.jumpRequested && isStateEnabled(instance, "Jumping")) {
             this.climbing = false;
             this.grounded = false;
             ladderKicked = true;
@@ -3848,7 +4050,14 @@ public final class PlaySession implements TreeListener {
         }
         if (!this.climbing) {
             Vector3 vector3Times = ((Vector3) objectRef.element).times(fFloatValue2);
-            if (ladderKicked) {
+            if (platformStand) {
+                if (this.grounded) {
+                    float damp = (float) Math.exp(-4.0f * dt);
+                    this.vel = new Vector3(this.vel.getX() * damp, this.vel.getY() - (f2 * dt), this.vel.getZ() * damp);
+                } else {
+                    this.vel = new Vector3(this.vel.getX(), this.vel.getY() - (f2 * dt), this.vel.getZ());
+                }
+            } else if (ladderKicked) {
                 this.vel = new Vector3(this.vel.getX(), this.vel.getY() - (f2 * dt), this.vel.getZ());
             } else if (this.grounded) {
                 this.vel = new Vector3(vector3Times.getX(), this.vel.getY() - (f2 * dt), vector3Times.getZ());
@@ -3860,17 +4069,17 @@ public final class PlaySession implements TreeListener {
                 float vz = this.vel.getZ() + ((vector3Times.getZ() - this.vel.getZ()) * blend);
                 this.vel = new Vector3(vx, this.vel.getY() - (f2 * dt), vz);
             }
-            if (Intrinsics.areEqual(instance.get("Jump"), (Object) true)) {
+            if (!platformStand && Intrinsics.areEqual(instance.get("Jump"), (Object) true)) {
                 this.jumpRequested = true;
                 instance.set("Jump", false, false);
             }
-            if (this.jumpRequested && this.grounded) {
+            if (!platformStand && this.jumpRequested && this.grounded && isStateEnabled(instance, "Jumping")) {
                 this.vel = new Vector3(this.vel.getX(), f4, this.vel.getZ());
                 this.grounded = false;
                 this.jumpAnimTime = 0.3f;
                 if (this.animator != null) {
                     this.animator.triggerJump();
-                playCharSound("Jumping", "rbxassetid://9114222045", 0.55f);
+                    playCharSound("Jumping", "rbxassetid://9114222045", 0.55f);
                 }
                 this.emote = null;
                 setState("Jumping", 3);
@@ -3893,9 +4102,9 @@ public final class PlaySession implements TreeListener {
             }
             this.grounded = z;
         }
-        this.jumpRequested = this.jumpHeld;
+        this.jumpRequested = !platformStand && this.jumpHeld;
         boolean z3 = this.shiftLock || this.firstPerson;
-        if (!this.climbing) {
+        if (!this.climbing && !platformStand) {
             if (z3) {
                 this.facing = this.camYaw;
             } else if (((Vector3) objectRef.element).getMagnitude() > f && !Intrinsics.areEqual(instance.get("AutoRotate"), (Object) false)) {
@@ -3915,16 +4124,86 @@ public final class PlaySession implements TreeListener {
         }
         if (this.climbing) {
             this.grounded = false;
+        } else if (z4 && !this.grounded && this.vel.getY() <= 0.5f && !this.jumpRequested) {
+            // 5-ray downhill ground-snapping raycast (center + 4 cardinal offsets at 0.65 * charHalfXZ)
+            float snapMax = 1.15f;
+            float charBottomY = this.pos.getY() + this.charMinY;
+            float rayStartY = RangesKt.coerceIn(this.pos.getY(), charBottomY + 0.5f, this.pos.getY() + this.charMaxY - 0.1f);
+            float originToBottom = rayStartY - charBottomY;
+            float minNy = minSlopeNy();
+            float rOff = this.charHalfXZ * 0.65f;
+            Vector3 probeLo = new Vector3(this.pos.getX() - this.charHalfXZ, charBottomY - snapMax, this.pos.getZ() - this.charHalfXZ);
+            Vector3 probeHi = new Vector3(this.pos.getX() + this.charHalfXZ, rayStartY + 0.1f, this.pos.getZ() + this.charHalfXZ);
+            List<Instance> floorCands = new ArrayList<>();
+            for (Instance fc : query(probeLo, probeHi, true)) {
+                if (!isCharacterPart(fc) && !Intrinsics.areEqual(fc.get("CanCollide"), Boolean.FALSE)) {
+                    floorCands.add(fc);
+                }
+            }
+            if (!floorCands.isEmpty()) {
+                float[] ox = new float[]{0.0f, rOff, -rOff, 0.0f, 0.0f};
+                float[] oz = new float[]{0.0f, 0.0f, 0.0f, rOff, -rOff};
+                Vector3 downRay = new Vector3(0.0f, -1.0f, 0.0f);
+                Function1<Instance, Boolean> allowAll = new Function1<Instance, Boolean>() {
+                    @Override
+                    public final Boolean invoke(Instance o) {
+                        return Boolean.TRUE;
+                    }
+                };
+                RayHit bestFloorHit = null;
+                float bestDrop = Float.MAX_VALUE;
+                for (int ri = 0; ri < 5; ri++) {
+                    Vector3 rayOrigin = new Vector3(this.pos.getX() + ox[ri], rayStartY, this.pos.getZ() + oz[ri]);
+                    RayHit floorHit = Geometry.INSTANCE.raycast(floorCands, rayOrigin, downRay, originToBottom + snapMax, allowAll);
+                    if (floorHit != null && floorHit.getNormal().getY() >= minNy - 1.0E-4f) {
+                        float drop = floorHit.getT() - originToBottom;
+                        if (drop > 0.0f && drop <= snapMax && drop < bestDrop) {
+                            bestDrop = drop;
+                            bestFloorHit = floorHit;
+                        }
+                    }
+                }
+                if (bestFloorHit != null) {
+                    this.pos = new Vector3(this.pos.getX(), this.pos.getY() - bestDrop, this.pos.getZ());
+                    if (this.vel.getY() < 0.0f) {
+                        this.vel = new Vector3(this.vel.getX(), 0.0f, this.vel.getZ());
+                    }
+                    this.grounded = true;
+                    this.groundNormal = bestFloorHit.getNormal();
+                    this.floorPart = bestFloorHit.getPart();
+                    this.floorLastCf = PartData.INSTANCE.cframe(bestFloorHit.getPart());
+                    setFloorMaterial(PartData.INSTANCE.material(bestFloorHit.getPart()));
+                }
+            }
         }
-        if (!z4 && this.grounded) {
+        if (!this.grounded || this.climbing || this.seated != null) {
+            this.floorPart = null;
+            this.floorLastCf = null;
+            setFloorMaterial(MATERIAL_AIR);
+        }
+        if (!z4 && this.grounded && !platformStand) {
             setState("Landed", 7);
             setState("Running", 8);
-        } else if (z4 && !this.grounded && !this.climbing && this.vel.getY() <= 0.0f) {
+        } else if (!this.grounded && !this.climbing && this.vel.getY() <= 0.0f && !"Freefall".equals(this.lastState) && !platformStand) {
+            if ("Jumping".equals(this.lastState)) {
+                LuaBoolean FALSE = LuaValue.FALSE;
+                Intrinsics.checkNotNullExpressionValue(FALSE, "FALSE");
+                this.rt.fire(instance, "Jumping", FALSE);
+            }
             setState("Freefall", 5);
             LuaRuntime luaRuntime5 = this.rt;
             LuaBoolean TRUE4 = LuaValue.TRUE;
             Intrinsics.checkNotNullExpressionValue(TRUE4, "TRUE");
             luaRuntime5.fire(instance, "FreeFalling", TRUE4);
+        }
+        if (this.grounded && !this.climbing && !platformStand && this.seated == null) {
+            float horizSpeed = (float) Math.hypot((double) this.vel.getX(), (double) this.vel.getZ());
+            if (this.lastRunningSpeed < 0.0f || Math.abs(horizSpeed - this.lastRunningSpeed) > 0.5f || (horizSpeed < 0.1f && this.lastRunningSpeed >= 0.1f)) {
+                this.lastRunningSpeed = horizSpeed;
+                LuaNumber spdVal = LuaValue.valueOf((double) horizSpeed);
+                Intrinsics.checkNotNullExpressionValue(spdVal, "valueOf(...)");
+                this.rt.fire(instance, "Running", spdVal);
+            }
         }
         trySit(dt);
         Object obj4 = this.dm.getWorkspace().get("FallenPartsDestroyHeight");
@@ -3952,105 +4231,118 @@ public final class PlaySession implements TreeListener {
     }
 
     private final void collideCharacter() {
-        int i;
-        Pair<Vector3, Float> pairContact;
-        boolean z = false;
-        int i2 = 0;
-        while (i2 < 6) {
-            Pair<Vector3, Vector3> pairCharBox = charBox();
-            Vector3 vector3Component1 = pairCharBox.component1();
-            Vector3 vector3Component2 = pairCharBox.component2();
-            ConvexShape convexShapeAabbShape = Geometry.INSTANCE.aabbShape(vector3Component1, vector3Component2);
-            boolean z2 = false;
-            Iterator<Instance> it = query(vector3Component1.minus(vector3Component2), vector3Component1.plus(vector3Component2), true).iterator();
-            while (true) {
-                if (!it.hasNext()) {
-                    i = i2;
-                    break;
+        float minNy = minSlopeNy();
+        boolean platformStand = this.humanoid != null && Intrinsics.areEqual(this.humanoid.get("PlatformStand"), (Object) true);
+        for (int iter = 0; iter < 6; iter++) {
+            Pair<Vector3, Vector3> initBox = charBox();
+            Vector3 initC = initBox.component1();
+            Vector3 initH = initBox.component2();
+            boolean resolvedAny = false;
+            for (Instance next : query(initC.minus(initH), initC.plus(initH), true)) {
+                if (Intrinsics.areEqual(next.get("CanCollide"), Boolean.FALSE) || isCharacterPart(next)) {
+                    continue;
                 }
-                Instance next = it.next();
-                if (Intrinsics.areEqual(next.get("CanCollide"), Boolean.valueOf(z))) {
-                    z = false;
-                } else if (!isCharacterPart(next) && (pairContact = Geometry.INSTANCE.contact(convexShapeAabbShape, vector3Component1.minus(vector3Component2), vector3Component1.plus(vector3Component2), next)) != null) {
-                    Vector3 vector3Component3 = pairContact.component1();
-                    float fFloatValue = pairContact.component2().floatValue();
-                    float magnitude = vector3Component3.getMagnitude();
-                    if (magnitude >= 1.0E-4f) {
-                        Vector3 vector3Div = vector3Component3.div(magnitude);
-                        float maxSlopeDeg = 89.0f;
-                        if (this.humanoid != null && (this.humanoid.get("MaxSlopeAngle") instanceof Number)) {
-                            maxSlopeDeg = RangesKt.coerceIn(((Number) this.humanoid.get("MaxSlopeAngle")).floatValue(), 0.0f, 89.0f);
-                        }
-                        float minSlopeNy = RangesKt.coerceIn((float) Math.cos(Math.toRadians((double) maxSlopeDeg)), 0.05f, 0.99f);
-                        if (vector3Div.getY() > Math.max(minSlopeNy, 0.35f)) {
-                            i = i2;
-                            this.pos = new Vector3(this.pos.getX(), this.pos.getY() + (magnitude / vector3Div.getY()), this.pos.getZ());
-                            if (this.vel.getY() < 0.0f) {
-                                this.vel = new Vector3(this.vel.getX(), 0.0f, this.vel.getZ());
-                            }
-                            this.grounded = true;
-                            this.groundNormal = vector3Div;
-                            if (this.humanoid != null) {
-                                Instance.set$default(this.humanoid, "FloorMaterial", new EnumValue(PartData.INSTANCE.material(next)), false, 4, null);
-                            }
-                        } else {
-                            i = i2;
-                            if (vector3Div.getY() < -0.55f) {
-                                this.pos = this.pos.plus(vector3Component3);
-                                if (this.vel.getY() > 0.0f) {
-                                    this.vel = new Vector3(this.vel.getX(), 0.0f, this.vel.getZ());
-                                }
-                            } else {
-                                float y = fFloatValue - (vector3Component1.getY() - vector3Component2.getY());
-                                if (y <= 0.0f || y > 2.1f || this.vel.getY() > 1.0f || this.climbing) {
-                                    this.pos = this.pos.plus(new Vector3(vector3Component3.getX(), 0.0f, vector3Component3.getZ()));
-                                    float hLen = (float) Math.hypot(vector3Div.getX(), vector3Div.getZ());
-                                    if (hLen > 0.01f) {
-                                        float nx = vector3Div.getX() / hLen;
-                                        float nz = vector3Div.getZ() / hLen;
-                                        float vn = (this.vel.getX() * nx) + (this.vel.getZ() * nz);
-                                        if (vn < 0.0f) {
-                                            this.vel = new Vector3(this.vel.getX() - (nx * vn), this.vel.getY(), this.vel.getZ() - (nz * vn));
-                                        }
-                                        this.wallBumpNormal = new Vector3(nx, 0.0f, nz);
-                                        this.wallBumpDecay = 1.0f;
-                                    }
-                                    if (this.grounded && y > 2.1f && y <= 4.8f && !this.climbing && this.humanoid != null && !Intrinsics.areEqual(this.humanoid.get("AutoJumpEnabled"), Boolean.FALSE)) {
-                                        this.jumpRequested = true;
-                                    }
-                                } else {
-                                    // Verify headroom before auto-stepping onto a ledge
-                                    Vector3 stepC = new Vector3(vector3Component1.getX(), vector3Component1.getY() + y + 0.02f, vector3Component1.getZ());
-                                    boolean blockedAbove = false;
-                                    ConvexShape stepShape = Geometry.INSTANCE.aabbShape(stepC, vector3Component2);
-                                    for (Instance ov : query(stepC.minus(vector3Component2), stepC.plus(vector3Component2), true)) {
-                                        if (ov != next && !isCharacterPart(ov) && !Intrinsics.areEqual(ov.get("CanCollide"), Boolean.FALSE)) {
-                                            Pair<Vector3, Float> oc = Geometry.INSTANCE.contact(stepShape, stepC.minus(vector3Component2), stepC.plus(vector3Component2), ov);
-                                            if (oc != null && oc.getFirst().getMagnitude() > 0.08f) {
-                                                blockedAbove = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if (!blockedAbove) {
-                                        this.pos = new Vector3(this.pos.getX(), this.pos.getY() + y + 0.01f, this.pos.getZ());
-                                    } else {
-                                        this.pos = this.pos.plus(new Vector3(vector3Component3.getX(), 0.0f, vector3Component3.getZ()));
-                                    }
-                                }
-                            }
-                        }
-                        z2 = true;
-                        break;
+                Pair<Vector3, Vector3> curBox = charBox();
+                Vector3 curC = curBox.component1();
+                Vector3 curH = curBox.component2();
+                ConvexShape curShape = Geometry.INSTANCE.aabbShape(curC, curH);
+                Pair<Vector3, Float> pairContact = Geometry.INSTANCE.contact(curShape, curC.minus(curH), curC.plus(curH), next);
+                if (pairContact == null) {
+                    continue;
+                }
+                Vector3 mtv = pairContact.component1();
+                float partMaxY = pairContact.component2().floatValue();
+                float magnitude = mtv.getMagnitude();
+                if (magnitude < 1.0E-4f) {
+                    continue;
+                }
+                Vector3 normal = mtv.div(magnitude);
+                float ny = normal.getY();
+                if (ny >= minNy - 1.0E-4f) {
+                    if (ny >= 0.5f) {
+                        this.pos = new Vector3(this.pos.getX(), this.pos.getY() + (magnitude / ny), this.pos.getZ());
+                    } else {
+                        this.pos = this.pos.plus(mtv);
                     }
-                    z = false;
+                    if (this.vel.getY() < 0.0f) {
+                        this.vel = new Vector3(this.vel.getX(), 0.0f, this.vel.getZ());
+                    }
+                    this.grounded = true;
+                    this.groundNormal = normal;
+                    this.floorPart = next;
+                    this.floorLastCf = PartData.INSTANCE.cframe(next);
+                    setFloorMaterial(PartData.INSTANCE.material(next));
+                } else if (ny > 0.05f) {
+                    this.pos = this.pos.plus(mtv);
+                    float vDotN = this.vel.dot(normal);
+                    if (vDotN < 0.0f) {
+                        this.vel = this.vel.minus(normal.times(vDotN));
+                    }
+                } else if (ny < -0.25f) {
+                    this.pos = this.pos.plus(mtv);
+                    float vDotN = this.vel.dot(normal);
+                    if (vDotN < 0.0f) {
+                        this.vel = this.vel.minus(normal.times(vDotN));
+                    }
+                } else {
+                    float hLen = (float) Math.hypot((double) normal.getX(), (double) normal.getZ());
+                    float nx = hLen > 0.01f ? normal.getX() / hLen : 0.0f;
+                    float nz = hLen > 0.01f ? normal.getZ() / hLen : 0.0f;
+                    float charBottomY = curC.getY() - curH.getY();
+                    float rayTopY = Math.min(charBottomY + 2.15f, this.pos.getY() + this.charMaxY);
+                    float rayLen = Math.max(0.1f, (rayTopY - charBottomY) + 0.05f);
+                    Vector3 downDir = new Vector3(0.0f, -1.0f, 0.0f);
+                    Pair<Float, Vector3> stepHit = Geometry.INSTANCE.rayPart(new Vector3(this.pos.getX() + (nx * this.charHalfXZ * 0.5f), rayTopY, this.pos.getZ() + (nz * this.charHalfXZ * 0.5f)), downDir, next);
+                    if (stepHit == null) {
+                        stepHit = Geometry.INSTANCE.rayPart(new Vector3(this.pos.getX(), rayTopY, this.pos.getZ()), downDir, next);
+                    }
+                    boolean canStep = false;
+                    float stepDy = 0.0f;
+                    if (!platformStand && !this.climbing && this.vel.getY() <= 1.0f && stepHit != null && stepHit.getFirst().floatValue() <= rayLen) {
+                        float hitY = rayTopY - stepHit.getFirst().floatValue();
+                        stepDy = hitY - charBottomY;
+                        if (stepHit.getSecond().getY() >= minNy - 1.0E-4f && stepDy > 0.02f && stepDy <= 2.1f) {
+                            canStep = true;
+                        }
+                    }
+                    boolean stepped = false;
+                    if (canStep) {
+                        Vector3 stepC = new Vector3(curC.getX(), curC.getY() + stepDy + 0.02f, curC.getZ());
+                        boolean blockedAbove = false;
+                        ConvexShape stepShape = Geometry.INSTANCE.aabbShape(stepC, curH);
+                        for (Instance ov : query(stepC.minus(curH), stepC.plus(curH), true)) {
+                            if (ov != next && !isCharacterPart(ov) && !Intrinsics.areEqual(ov.get("CanCollide"), Boolean.FALSE)) {
+                                Pair<Vector3, Float> oc = Geometry.INSTANCE.contact(stepShape, stepC.minus(curH), stepC.plus(curH), ov);
+                                if (oc != null && oc.getFirst().getMagnitude() > 0.08f) {
+                                    blockedAbove = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!blockedAbove) {
+                            this.pos = new Vector3(this.pos.getX(), this.pos.getY() + stepDy + 0.01f, this.pos.getZ());
+                            stepped = true;
+                        }
+                    }
+                    if (!stepped) {
+                        this.pos = this.pos.plus(new Vector3(mtv.getX(), 0.0f, mtv.getZ()));
+                        if (hLen > 0.01f) {
+                            float vn = (this.vel.getX() * nx) + (this.vel.getZ() * nz);
+                            if (vn < 0.0f) {
+                                this.vel = new Vector3(this.vel.getX() - (nx * vn), this.vel.getY(), this.vel.getZ() - (nz * vn));
+                            }
+                        }
+                        float yTopDiff = partMaxY - charBottomY;
+                        if (this.grounded && !platformStand && yTopDiff > 2.1f && yTopDiff <= 4.8f && !this.climbing && this.humanoid != null && !Intrinsics.areEqual(this.humanoid.get("AutoJumpEnabled"), Boolean.FALSE)) {
+                            this.jumpRequested = true;
+                        }
+                    }
                 }
+                resolvedAny = true;
             }
-            if (!z2) {
+            if (!resolvedAny) {
                 return;
             }
-            i2 = i + 1;
-            z = false;
         }
     }
 
@@ -4276,14 +4568,14 @@ public final class PlaySession implements TreeListener {
                 }
             }
         }
-        Collection arrayList2 = new ArrayList();
-        for (Object obj : out) {
-            Pair<Vector3, Vector3> pairPartAabb = Geometry.INSTANCE.partAabb((Instance) obj);
-            if (Geometry.INSTANCE.aabbOverlap(a, b, pairPartAabb.component1(), pairPartAabb.component2(), 0.05f)) {
-                arrayList2.add(obj);
+        ArrayList<Instance> result = new ArrayList<>(out.size());
+        for (int idx = 0, n = out.size(); idx < n; idx++) {
+            Instance p = (Instance) out.get(idx);
+            if (Geometry.INSTANCE.partAabbOverlap(p, a, b, 0.05f)) {
+                result.add(p);
             }
         }
-        return (List) arrayList2;
+        return result;
     }
 
     private final void rebuildPhysics() {
@@ -7346,6 +7638,31 @@ public final class PlaySession implements TreeListener {
         addLine(new ChatLine(null, text, color, true, 0L, 16, null));
     }
 
+    public final boolean playEmote(String name) {
+        if (name == null) {
+            return false;
+        }
+        String key = name.trim().toLowerCase(Locale.ROOT);
+        String resolved;
+        switch (key) {
+            case "wave":
+            case "point":
+            case "cheer":
+                resolved = key;
+                break;
+            case "dance":
+            case "dance2":
+            case "dance3":
+                resolved = "dance";
+                break;
+            default:
+                return false;
+        }
+        this.emote = resolved;
+        this.emoteTime = 0.0f;
+        return true;
+    }
+
     /* JADX WARN: Code duplicated, block: B:51:0x00e6  */
     /* JADX WARN: Code duplicated, block: B:53:0x00ec  */
     /* JADX WARN: Code duplicated, block: B:54:0x00ee  */
@@ -7398,65 +7715,9 @@ public final class PlaySession implements TreeListener {
             }
             if (StringsKt.startsWith(lowerCase, "e ", false) || StringsKt.startsWith(lowerCase, "emote ", false)) {
                 String string2 = StringsKt.trim((CharSequence) com.goydevv.studrblx.util.KtCompat.substringAfter(lowerCase, ' ')).toString();
-                switch (string2.hashCode()) {
-                    case -1339095329:
-                        if (string2.equals("dance2")) {
-                            if (StringsKt.startsWith(string2, "dance", false)) {
-                                str = string2;
-                            } else {
-                                str = "dance";
-                            }
-                        }
-                        break;
-                    case -1339095328:
-                        if (string2.equals("dance3")) {
-                            if (StringsKt.startsWith(string2, "dance", false)) {
-                                str = string2;
-                            } else {
-                                str = "dance";
-                            }
-                        }
-                        break;
-                    case 3642105:
-                        if (string2.equals("wave")) {
-                            if (StringsKt.startsWith(string2, "dance", false)) {
-                                str = string2;
-                            } else {
-                                str = "dance";
-                            }
-                        }
-                        break;
-                    case 94627149:
-                        if (string2.equals("cheer")) {
-                            if (StringsKt.startsWith(string2, "dance", false)) {
-                                str = string2;
-                            } else {
-                                str = "dance";
-                            }
-                        }
-                        break;
-                    case 95350707:
-                        if (string2.equals("dance")) {
-                            if (StringsKt.startsWith(string2, "dance", false)) {
-                                str = string2;
-                            } else {
-                                str = "dance";
-                            }
-                        }
-                        break;
-                    case 106845584:
-                        if (string2.equals("point")) {
-                            if (StringsKt.startsWith(string2, "dance", false)) {
-                                str = string2;
-                            } else {
-                                str = "dance";
-                            }
-                        }
-                        break;
-                }
-                this.emote = str;
-                this.emoteTime = 0.0f;
-                if (this.emote == null) {
+                if (!playEmote(string2)) {
+                    this.emote = null;
+                    this.emoteTime = 0.0f;
                     systemMessage("You can't use that emote.", -4934476);
                 }
                 LuaRuntime luaRuntime = this.rt;

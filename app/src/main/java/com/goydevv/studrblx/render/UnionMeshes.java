@@ -11,6 +11,7 @@ import com.goydevv.studrblx.model.Instance;
 import com.goydevv.studrblx.model.SharedStr;
 import com.goydevv.studrblx.model.Vector3;
 import com.goydevv.studrblx.net.AssetFetcher;
+import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -29,6 +30,7 @@ import kotlin.TuplesKt;
 import kotlin.Unit;
 import kotlin.collections.ArraysKt;
 import kotlin.collections.CollectionsKt;
+import kotlin.io.FilesKt;
 import kotlin.jvm.functions.Function0;
 import kotlin.jvm.functions.Function1;
 import kotlin.jvm.internal.Intrinsics;
@@ -118,24 +120,16 @@ public final class UnionMeshes {
     }
 
     public final boolean isStored(Instance p) {
-        boolean z;
         Intrinsics.checkNotNullParameter(p, "p");
         if (!p.isA("PartOperation") || Intrinsics.areEqual(p.getClassName(), "NegateOperation")) {
             return false;
         }
-        Iterable children = p.getChildren();
-        if ((children instanceof Collection) && ((Collection) children).isEmpty()) {
-            z = true;
-        } else {
-            Iterator it = children.iterator();
-            while (it.hasNext()) {
-                if (((Instance) it.next()).isA("BasePart")) {
-                    z = false;
-                }
+        for (Instance child : p.getChildren()) {
+            if (child.isA("BasePart")) {
+                return false;
             }
-            z = true;
         }
-        return z;
+        return true;
     }
 
     /* JADX WARN: Code duplicated, block: B:11:0x0026  */
@@ -216,8 +210,9 @@ public final class UnionMeshes {
         if (bad.contains(key2) || pending.contains(key2)) {
             return null;
         }
-        final byte[] bytes = AssetFetcher.INSTANCE.request(id);
-        if (bytes == null) {
+        final File cached = AssetFetcher.INSTANCE.cachedFile(id);
+        if (cached == null) {
+            AssetFetcher.INSTANCE.prefetch(id);
             if (!listening) {
                 listening = true;
                 AssetFetcher.INSTANCE.getListeners().add(new Function1() { // from class: com.goydevv.studrblx.render.UnionMeshes$$ExternalSyntheticLambda3
@@ -238,7 +233,12 @@ public final class UnionMeshes {
                 UnionMeshes.INSTANCE.build(key2, p.getName(), new Function0() { // from class: com.goydevv.studrblx.render.UnionMeshes$$ExternalSyntheticLambda0
                     @Override // kotlin.jvm.functions.Function0
                     public final Object invoke() {
-                        try { return UnionMeshes.INSTANCE.meshDataFromAsset(bytes); } catch (Throwable _ktEx) { throw com.goydevv.studrblx.util.KtCompat.sneakyThrow(_ktEx); }
+                        try {
+                            byte[] bytes = FilesKt.readBytes(cached);
+                            return UnionMeshes.INSTANCE.meshDataFromAsset(bytes);
+                        } catch (Throwable _ktEx) {
+                            throw com.goydevv.studrblx.util.KtCompat.sneakyThrow(_ktEx);
+                        }
                     }
                 });
             }

@@ -84,7 +84,7 @@ import org.luaj.vm2.lib.jse.JsePlatform;
 /* JADX INFO: compiled from: LuaRuntime.kt */
 /* JADX INFO: loaded from: classes4.dex */
 public final class LuaRuntime {
-    private static final long WAIT_BUDGET_NS = 30000000L;
+    private static final long WAIT_BUDGET_NS = 8000000L;
     private static volatile File luacDir;
     private static volatile String stamp;
     private final InstanceApi api;
@@ -118,6 +118,15 @@ public final class LuaRuntime {
     private final TreeListener treeListener;
     private final ArrayList<Tween> tweens;
     private final ArrayList<Waiting> waiting;
+    private Instance focusedTextBox;
+
+    public final Instance getFocusedTextBox() {
+        return this.focusedTextBox;
+    }
+
+    public final void setFocusedTextBox(Instance inst) {
+        this.focusedTextBox = inst;
+    }
     private final WeakHashMap<Instance, LuaValue> wrappers;
 
     /* JADX INFO: renamed from: Companion, reason: from kotlin metadata */
@@ -880,7 +889,6 @@ public final class LuaRuntime {
 
     /* JADX WARN: Code duplicated, block: B:19:0x004d  */
     public final void fireArgs(Object owner, String name, Varargs args) {
-        boolean direct = false;
         Intrinsics.checkNotNullParameter(owner, "owner");
         Intrinsics.checkNotNullParameter(name, "name");
         Intrinsics.checkNotNullParameter(args, "args");
@@ -890,9 +898,7 @@ public final class LuaRuntime {
         HashMap<String, ArrayList<Connection>> map = this.conns.get(owner);
         ArrayList<Connection> arrayList = map != null ? map.get(name) : null;
         if (arrayList != null && !arrayList.isEmpty()) {
-            if (!this.directEvents.contains(name)) {
-                direct = StringsKt.startsWith(name, "Changed:", false) || StringsKt.startsWith(name, "Attr:", false);
-            }
+            boolean direct = this.directEvents.contains(name) || StringsKt.startsWith(name, "Changed:", false) || StringsKt.startsWith(name, "Attr:", false);
             for (Connection c : CollectionsKt.toList(arrayList)) {
                 if (c.getConnected()) {
                     if (c.getOnce()) {
@@ -929,43 +935,27 @@ public final class LuaRuntime {
     public final Varargs callDirect(LuaValue fn, Varargs args) {
         Intrinsics.checkNotNullParameter(fn, "fn");
         Intrinsics.checkNotNullParameter(args, "args");
-        boolean nested = this.resumeStart != 0 && System.currentTimeMillis() - this.resumeStart < 10000;
-        if (!nested) {
+        long outer = this.resumeStart;
+        if (outer == 0L) {
             this.resumeStart = System.currentTimeMillis();
         }
         Varargs varargsInvoke = null;
         try {
-            try {
-                try {
-                    varargsInvoke = fn.invoke(args);
-                    if (!nested) {
-                        this.resumeStart = 0L;
-                    }
-                } catch (StackOverflowError e) {
-                    reportError("stack overflow");
-                    if (!nested) {
-                    }
-                }
-            } catch (LuaError e2) {
-                String message = e2.getMessage();
-                if (message == null) {
-                    message = e2.toString();
-                }
-                reportError(message);
-                if (!nested) {
-                }
-            } catch (RuntimeException e3) {
-                reportError(e3.toString());
-                if (!nested) {
-                }
+            varargsInvoke = fn.invoke(args);
+        } catch (StackOverflowError e) {
+            reportError("stack overflow");
+        } catch (LuaError e2) {
+            String message = e2.getMessage();
+            if (message == null) {
+                message = e2.toString();
             }
-            return varargsInvoke;
-        } catch (Throwable th) {
-            if (!nested) {
-                this.resumeStart = 0L;
-            }
-            throw th;
+            reportError(message);
+        } catch (RuntimeException e3) {
+            reportError(e3.toString());
+        } finally {
+            this.resumeStart = outer;
         }
+        return varargsInvoke;
     }
 
     public final LuaThread newThread(LuaValue fn) {
@@ -1000,11 +990,9 @@ public final class LuaRuntime {
                 reportError(str);
             }
         } catch (Throwable e) {
-            try {
-                reportError(e.toString());
-            } finally {
-                this.resumeStart = outer;
-            }
+            reportError(e.toString());
+        } finally {
+            this.resumeStart = outer;
         }
     }
 
@@ -1246,16 +1234,18 @@ public final class LuaRuntime {
             if (tw.getState() == 2 || tw.getState() == 1) {
                 tw.setElapsed(tw.getElapsed() + dt);
                 if (tw.getState() == 1) {
-                    if (tw.getElapsed() >= tw.getInfo().getDelay()) {
-                        tw.setState(2);
-                        tw.setElapsed(0.0f);
-                        Iterable iterableKeySet = tw.getGoals().keySet();
-                        LinkedHashMap linkedHashMap = new LinkedHashMap(RangesKt.coerceAtLeast(MapsKt.mapCapacity(CollectionsKt.collectionSizeOrDefault(iterableKeySet, 10)), 16));
-                        for (Object obj : iterableKeySet) {
-                            linkedHashMap.put(obj, this.api.getK(tw.getInst(), (String) obj));
-                        }
-                        tw.setStart(linkedHashMap);
+                    float delay = tw.getInfo().getDelay();
+                    if (tw.getElapsed() < delay) {
+                        continue;
                     }
+                    tw.setState(2);
+                    tw.setElapsed(tw.getElapsed() - delay);
+                    Iterable iterableKeySet = tw.getGoals().keySet();
+                    LinkedHashMap linkedHashMap = new LinkedHashMap(RangesKt.coerceAtLeast(MapsKt.mapCapacity(CollectionsKt.collectionSizeOrDefault(iterableKeySet, 10)), 16));
+                    for (Object obj : iterableKeySet) {
+                        linkedHashMap.put(obj, this.api.getK(tw.getInst(), (String) obj));
+                    }
+                    tw.setStart(linkedHashMap);
                 }
                 float dur = RangesKt.coerceAtLeast(tw.getInfo().getTime(), 1.0E-4f);
                 float a = RangesKt.coerceIn(tw.getElapsed() / dur, 0.0f, 1.0f);
@@ -1283,6 +1273,13 @@ public final class LuaRuntime {
                         tw.setState(4);
                         this.tweens.remove(tw);
                         fire(tw, "Completed", LuaTypes.INSTANCE.wrap(new EnumItemV("PlaybackState", "Completed", 4)));
+                        LuaValue cb = tw.getGuiCallback();
+                        if (cb != null && cb.isfunction()) {
+                            try {
+                                cb.call(LuaTypes.INSTANCE.wrap(new EnumItemV("TweenStatus", "Completed", 1)));
+                            } catch (Exception ignored) {
+                            }
+                        }
                     }
                 }
             }
@@ -1290,34 +1287,40 @@ public final class LuaRuntime {
     }
 
     static final boolean playTween$lambda$23(Tween $tw, Tween it) {
-        boolean z;
         Intrinsics.checkNotNullParameter(it, "it");
         if (it == $tw || it.getInst() != $tw.getInst()) {
             return false;
         }
-        Iterable iterableKeySet = it.getGoals().keySet();
-        if ((iterableKeySet instanceof Collection) && ((Collection) iterableKeySet).isEmpty()) {
-            z = false;
-        } else {
-            Iterator it2 = iterableKeySet.iterator();
-            while (it2.hasNext()) {
-                if ($tw.getGoals().containsKey((String) it2.next())) {
-                    z = true;
-                }
+        for (String k : it.getGoals().keySet()) {
+            if ($tw.getGoals().containsKey(k)) {
+                return true;
             }
-            z = false;
         }
-        return z;
+        return false;
     }
 
     public final void playTween(final Tween tw) {
         Intrinsics.checkNotNullParameter(tw, "tw");
-        CollectionsKt.removeAll((List) this.tweens, new Function1() { // from class: com.goydevv.studrblx.lua.LuaRuntime$$ExternalSyntheticLambda1
-            @Override // kotlin.jvm.functions.Function1
-            public final Object invoke(Object obj) {
-                return Boolean.valueOf(LuaRuntime.playTween$lambda$23(tw, (Tween) obj));
+        ArrayList<Tween> cancelled = new ArrayList<>();
+        for (Tween existing : this.tweens) {
+            if (playTween$lambda$23(tw, existing)) {
+                cancelled.add(existing);
             }
-        });
+        }
+        if (!cancelled.isEmpty()) {
+            this.tweens.removeAll(cancelled);
+            for (Tween c : cancelled) {
+                c.setState(5);
+                fire(c, "Completed", LuaTypes.INSTANCE.wrap(new EnumItemV("PlaybackState", "Cancelled", 5)));
+                LuaValue cb = c.getGuiCallback();
+                if (cb != null && cb.isfunction()) {
+                    try {
+                        cb.call(LuaTypes.INSTANCE.wrap(new EnumItemV("TweenStatus", "Canceled", 0)));
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        }
         if (tw.getState() == 3) {
             tw.setState(2);
             if (this.tweens.contains(tw)) {

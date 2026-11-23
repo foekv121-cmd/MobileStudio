@@ -57,16 +57,27 @@ public final class PlayHud extends FrameLayout {
     private final TopButton chatBtn;
     private final ChatLog chatLog;
     private boolean chatOpen;
+    private int cutB;
+    private int cutL;
+    private int cutR;
+    private int cutT;
     private final float d;
+    private View expDropdown;
+    private boolean inventoryOpen = true;
     private long lastChatActivity;
     private final Layer layer;
-    private final TopButton listBtn;
+    private final FrameLayout.LayoutParams lpChatBox;
     private View menu;
     private final TopButton menuBtn;
+    private final TopButton hamburgerBtn;
+    private final TopButton micBtn;
+    private final LinearLayout topPill;
+    private boolean micMuted = true;
     private boolean playerListOpen;
     private final Typeface regular;
     private int seenChat;
     private final Studio studio;
+    private boolean unreadChat;
 
     /* JADX WARN: 'super' call moved to the top of the method (can break code semantics) */
     public PlayHud(Context ctx, Studio studio) {
@@ -79,8 +90,10 @@ public final class PlayHud extends FrameLayout {
         this.regular = Fonts.INSTANCE.forFamily("BuilderSans", 400, false).getTypeface();
         this.layer = new Layer(this, ctx);
         this.menuBtn = new TopButton(this, ctx, 0);
+        this.hamburgerBtn = new TopButton(this, ctx, 3);
         this.chatBtn = new TopButton(this, ctx, 1);
-        this.listBtn = new TopButton(this, ctx, 2);
+        this.micBtn = new TopButton(this, ctx, 4);
+        this.topPill = new LinearLayout(ctx);
         this.chatBox = new LinearLayout(ctx);
         this.chatLog = new ChatLog(this, ctx);
         this.chatOpen = true;
@@ -88,25 +101,74 @@ public final class PlayHud extends FrameLayout {
         this.seenChat = -1;
         setVisibility(8);
         addView(this.layer, new FrameLayout.LayoutParams(-1, -1));
-        int top = dp(8.0f);
-        TopButton topButton = this.menuBtn;
-        FrameLayout.LayoutParams layoutParams = new FrameLayout.LayoutParams(dp(36.0f), dp(36.0f));
-        layoutParams.leftMargin = dp(12.0f);
-        layoutParams.topMargin = top;
-        Unit unit = Unit.INSTANCE;
-        addView(topButton, layoutParams);
-        TopButton topButton2 = this.chatBtn;
-        FrameLayout.LayoutParams layoutParams2 = new FrameLayout.LayoutParams(dp(36.0f), dp(36.0f));
-        layoutParams2.leftMargin = dp(54.0f);
-        layoutParams2.topMargin = top;
-        Unit unit2 = Unit.INSTANCE;
-        addView(topButton2, layoutParams2);
-        TopButton topButton3 = this.listBtn;
-        FrameLayout.LayoutParams layoutParams3 = new FrameLayout.LayoutParams(dp(36.0f), dp(36.0f), GravityCompat.END);
-        layoutParams3.rightMargin = dp(12.0f);
-        layoutParams3.topMargin = top;
-        Unit unit3 = Unit.INSTANCE;
-        addView(topButton3, layoutParams3);
+        final int top = dp(7.0f);
+        final FrameLayout.LayoutParams lpMenu = new FrameLayout.LayoutParams(dp(44.0f), dp(44.0f));
+        lpMenu.leftMargin = dp(12.0f) + this.cutL;
+        lpMenu.topMargin = top + this.cutT;
+        addView(this.menuBtn, lpMenu);
+
+        // Unified Experience Controls capsule pill [≡ | Chat | Mic] matching Roblox Experience Controls (82314.png)
+        this.topPill.setOrientation(0);
+        this.topPill.setGravity(16);
+        GradientDrawable pillBg = new GradientDrawable();
+        pillBg.setColor(0xE0111318);
+        pillBg.setCornerRadius(dp(22.0f));
+        this.topPill.setBackground(pillBg);
+        this.topPill.setPadding(dp(6.0f), 0, dp(6.0f), 0);
+        this.topPill.addView(this.hamburgerBtn, new LinearLayout.LayoutParams(dp(44.0f), dp(44.0f)));
+        this.topPill.addView(this.chatBtn, new LinearLayout.LayoutParams(dp(44.0f), dp(44.0f)));
+        this.topPill.addView(this.micBtn, new LinearLayout.LayoutParams(dp(44.0f), dp(44.0f)));
+        final FrameLayout.LayoutParams lpPill = new FrameLayout.LayoutParams(-2, dp(44.0f));
+        lpPill.leftMargin = dp(68.0f) + this.cutL;
+        lpPill.topMargin = top + this.cutT;
+        addView(this.topPill, lpPill);
+
+        this.hamburgerBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                PlayHud.this.toggleExpDropdown();
+            }
+        });
+        this.micBtn.setActive(false);
+        this.micBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                PlayHud.this.micMuted = !PlayHud.this.micMuted;
+                PlayHud.this.micBtn.setActive(!PlayHud.this.micMuted);
+                PlayHud.this.micBtn.invalidate();
+            }
+        });
+        // Respect Android DisplayCutout / Safe Area insets
+        setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+            @Override
+            public android.view.WindowInsets onApplyWindowInsets(View v, android.view.WindowInsets insets) {
+                int cL = 0;
+                int cR = 0;
+                int cT = 0;
+                int cB = 0;
+                if (android.os.Build.VERSION.SDK_INT >= 28 && insets != null && insets.getDisplayCutout() != null) {
+                    cL = insets.getDisplayCutout().getSafeInsetLeft();
+                    cR = insets.getDisplayCutout().getSafeInsetRight();
+                    cT = insets.getDisplayCutout().getSafeInsetTop();
+                    cB = insets.getDisplayCutout().getSafeInsetBottom();
+                }
+                PlayHud.this.cutL = cL;
+                PlayHud.this.cutR = cR;
+                PlayHud.this.cutT = cT;
+                PlayHud.this.cutB = cB;
+                lpMenu.leftMargin = dp(12.0f) + cL;
+                lpMenu.topMargin = top + cT;
+                lpPill.leftMargin = dp(68.0f) + cL;
+                lpPill.topMargin = top + cT;
+                PlayHud.this.lpChatBox.leftMargin = dp(12.0f) + cL;
+                PlayHud.this.lpChatBox.topMargin = dp(58.0f) + cT;
+                PlayHud.this.menuBtn.setLayoutParams(lpMenu);
+                PlayHud.this.topPill.setLayoutParams(lpPill);
+                PlayHud.this.chatBox.setLayoutParams(PlayHud.this.lpChatBox);
+                PlayHud.this.layer.invalidate();
+                return insets;
+            }
+        });
         this.menuBtn.setOnClickListener(new View.OnClickListener() { // from class: com.goydevv.studrblx.ui.PlayHud$$ExternalSyntheticLambda4
             @Override // android.view.View.OnClickListener
             public final void onClick(View view) {
@@ -117,12 +179,6 @@ public final class PlayHud extends FrameLayout {
             @Override // android.view.View.OnClickListener
             public final void onClick(View view) {
                 PlayHud._init_$lambda$4(PlayHud.this, view);
-            }
-        });
-        this.listBtn.setOnClickListener(new View.OnClickListener() { // from class: com.goydevv.studrblx.ui.PlayHud$$ExternalSyntheticLambda6
-            @Override // android.view.View.OnClickListener
-            public final void onClick(View view) {
-                PlayHud.this.togglePlayerList();
             }
         });
         this.chatBox.setOrientation(1);
@@ -167,11 +223,11 @@ public final class PlayHud extends FrameLayout {
         linearLayout2.addView(editText2, layoutParams4);
         boolean phone = getResources().getConfiguration().smallestScreenWidthDp < 600;
         LinearLayout linearLayout3 = this.chatBox;
-        FrameLayout.LayoutParams layoutParams5 = new FrameLayout.LayoutParams(dp(phone ? 270.0f : 330.0f), dp(phone ? 130.0f : 165.0f));
-        layoutParams5.leftMargin = dp(12.0f);
-        layoutParams5.topMargin = dp(56.0f);
+        this.lpChatBox = new FrameLayout.LayoutParams(dp(phone ? 270.0f : 330.0f), dp(phone ? 130.0f : 165.0f));
+        this.lpChatBox.leftMargin = dp(12.0f) + this.cutL;
+        this.lpChatBox.topMargin = dp(58.0f) + this.cutT;
         Unit unit5 = Unit.INSTANCE;
-        addView(linearLayout3, layoutParams5);
+        addView(linearLayout3, this.lpChatBox);
     }
 
     /* JADX INFO: Access modifiers changed from: private */
@@ -181,7 +237,9 @@ public final class PlayHud extends FrameLayout {
 
     static final void _init_$lambda$4(PlayHud this$0, View it) {
         this$0.chatOpen = !this$0.chatOpen;
-        if (!this$0.chatOpen) {
+        if (this$0.chatOpen) {
+            this$0.unreadChat = false;
+        } else {
             this$0.hideKeyboard();
         }
         this$0.updateChatVisibility();
@@ -233,10 +291,13 @@ public final class PlayHud extends FrameLayout {
         if (playing) {
             this.lastChatActivity = System.currentTimeMillis();
             this.seenChat = -1;
+            this.unreadChat = false;
         } else {
+            closeExpDropdown();
             closeMenu();
             hideKeyboard();
             this.chatBar.setText("");
+            this.unreadChat = false;
         }
         updateChatVisibility();
     }
@@ -255,13 +316,17 @@ public final class PlayHud extends FrameLayout {
         if (getVisibility() == 0 && (p = this.studio.getPlay()) != null) {
             int v = p.getChatVersion();
             if (v != this.seenChat) {
+                boolean hadSeen = this.seenChat != -1;
                 this.seenChat = v;
                 this.lastChatActivity = System.currentTimeMillis();
                 this.chatLog.reload();
+                if (hadSeen && !this.chatOpen && !p.getChatLines().isEmpty()) {
+                    this.unreadChat = true;
+                    this.chatBtn.invalidate();
+                }
             }
             boolean idle = System.currentTimeMillis() - this.lastChatActivity > 12000 && !this.chatBar.hasFocus();
             this.chatBox.setAlpha(idle ? 0.35f : 1.0f);
-            this.listBtn.setVisibility(p.getCorePlayerList() ? 0 : 8);
             if (this.chatBtn.getVisibility() != (p.getCoreChat() ? 0 : 8)) {
                 updateChatVisibility();
             }
@@ -271,9 +336,157 @@ public final class PlayHud extends FrameLayout {
 
     public final void togglePlayerList() {
         this.playerListOpen = !this.playerListOpen;
-        this.listBtn.setActive(this.playerListOpen);
-        this.listBtn.invalidate();
         this.layer.invalidate();
+    }
+
+    public final boolean isInventoryOpen() {
+        return this.inventoryOpen;
+    }
+
+    public final void toggleInventory() {
+        this.inventoryOpen = !this.inventoryOpen;
+        if (getParent() instanceof ViewportView) {
+            ((ViewportView) getParent()).getControls().invalidate();
+        }
+    }
+
+    public final void toggleExpDropdown() {
+        if (this.expDropdown != null) {
+            closeExpDropdown();
+        } else {
+            openExpDropdown();
+        }
+    }
+
+    private final void closeExpDropdown() {
+        View view = this.expDropdown;
+        if (view != null) {
+            removeView(view);
+        }
+        this.expDropdown = null;
+    }
+
+    private final void openExpDropdown() {
+        closeExpDropdown();
+        hideKeyboard();
+        FrameLayout scrim = new FrameLayout(getContext());
+        scrim.setClickable(true);
+        scrim.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                PlayHud.this.closeExpDropdown();
+            }
+        });
+        final LinearLayout card = new LinearLayout(getContext());
+        card.setOrientation(1);
+        card.setClickable(true);
+        GradientDrawable cardBg = new GradientDrawable();
+        cardBg.setColor(0xE0111318);
+        cardBg.setCornerRadius(dp(12.0f));
+        card.setBackground(cardBg);
+        card.setPadding(0, dp(4.0f), 0, dp(4.0f));
+        populateExpMainRows(card);
+        FrameLayout.LayoutParams lpCard = new FrameLayout.LayoutParams(dp(188.0f), -2);
+        lpCard.leftMargin = dp(68.0f) + this.cutL;
+        lpCard.topMargin = dp(58.0f) + this.cutT;
+        scrim.addView(card, lpCard);
+        addView(scrim, new FrameLayout.LayoutParams(-1, -1));
+        this.expDropdown = scrim;
+    }
+
+    private final void addExpDropdownRow(LinearLayout card, String title, String trailing, boolean showDivider, View.OnClickListener listener) {
+        LinearLayout row = new LinearLayout(getContext());
+        row.setOrientation(0);
+        row.setGravity(16);
+        row.setClickable(true);
+        row.setPadding(dp(14.0f), dp(11.0f), dp(14.0f), dp(11.0f));
+        TextView titleTv = label(title, 14.0f, -1, true);
+        row.addView(titleTv, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        if (trailing != null && trailing.length() > 0) {
+            TextView trailingTv = label(trailing, 13.0f, 0xB3FFFFFF, false);
+            row.addView(trailingTv);
+        }
+        row.setOnClickListener(listener);
+        card.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        if (showDivider) {
+            View div = new View(getContext());
+            div.setBackgroundColor(0x22FFFFFF);
+            card.addView(div, new LinearLayout.LayoutParams(-1, 1));
+        }
+    }
+
+    private final void populateExpMainRows(final LinearLayout card) {
+        card.removeAllViews();
+        addExpDropdownRow(card, "Leaderboard", this.playerListOpen ? "On" : "Off", true, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                PlayHud.this.togglePlayerList();
+                PlayHud.this.closeExpDropdown();
+            }
+        });
+        addExpDropdownRow(card, "Emotes", "›", true, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                PlayHud.this.populateExpEmoteRows(card);
+            }
+        });
+        addExpDropdownRow(card, "Inventory", this.inventoryOpen ? "On" : "Off", true, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                PlayHud.this.toggleInventory();
+                PlayHud.this.closeExpDropdown();
+            }
+        });
+        addExpDropdownRow(card, "Respawn", null, true, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                synchronized (PlayHud.this.studio.getLock()) {
+                    PlaySession play = PlayHud.this.studio.getPlay();
+                    if (play != null) {
+                        play.resetCharacter();
+                    }
+                }
+                PlayHud.this.closeExpDropdown();
+            }
+        });
+        addExpDropdownRow(card, "Settings", null, false, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                PlayHud.this.closeExpDropdown();
+                PlayHud.this.openMenu(1);
+            }
+        });
+    }
+
+    private final void populateExpEmoteRows(final LinearLayout card) {
+        card.removeAllViews();
+        final String[][] emotes = new String[][]{
+            {"Wave", "wave"},
+            {"Point", "point"},
+            {"Cheer", "cheer"},
+            {"Dance", "dance"}
+        };
+        for (int i = 0; i < emotes.length; i++) {
+            final String emoteKey = emotes[i][1];
+            addExpDropdownRow(card, emotes[i][0], null, true, new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    synchronized (PlayHud.this.studio.getLock()) {
+                        PlaySession play = PlayHud.this.studio.getPlay();
+                        if (play != null) {
+                            play.playEmote(emoteKey);
+                        }
+                    }
+                    PlayHud.this.closeExpDropdown();
+                }
+            });
+        }
+        addExpDropdownRow(card, "‹ Back", null, false, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                PlayHud.this.populateExpMainRows(card);
+            }
+        });
     }
 
     public final void focusChat() {
@@ -282,6 +495,7 @@ public final class PlayHud extends FrameLayout {
             return;
         }
         this.chatOpen = true;
+        this.unreadChat = false;
         updateChatVisibility();
         this.chatBar.requestFocus();
         Object systemService = getContext().getSystemService("input_method");
@@ -290,6 +504,10 @@ public final class PlayHud extends FrameLayout {
     }
 
     public final boolean handleBack() {
+        if (this.expDropdown != null) {
+            closeExpDropdown();
+            return true;
+        }
         if (this.menu != null) {
             closeMenu();
             return true;
@@ -326,6 +544,12 @@ public final class PlayHud extends FrameLayout {
                 case 1:
                     str = "Chat";
                     break;
+                case 3:
+                    str = "Experience controls";
+                    break;
+                case 4:
+                    str = "Microphone";
+                    break;
                 default:
                     str = "Leaderboard";
                     break;
@@ -350,41 +574,81 @@ public final class PlayHud extends FrameLayout {
             Intrinsics.checkNotNullParameter(c, "c");
             float cx = getWidth() / 2.0f;
             float cy = getHeight() / 2.0f;
-            float r = getWidth() / 2.0f;
-            this.p.setStyle(Paint.Style.FILL);
-            this.p.setColor(isPressed() ? 0xE6282B33 : 0xCC121419);
-            c.drawCircle(cx, cy, r - (this.this$0.d * 0.6f), this.p);
-            this.p.setStyle(Paint.Style.STROKE);
-            this.p.setStrokeWidth(this.this$0.d * 1.0f);
-            this.p.setColor(0x33FFFFFF);
-            c.drawCircle(cx, cy, r - (this.this$0.d * 0.8f), this.p);
+            float d = this.this$0.d;
+            boolean inCapsule = (this.kind == 1 || this.kind == 3 || this.kind == 4);
+            if (!inCapsule) {
+                float r = Math.min(getWidth(), getHeight()) / 2.0f;
+                this.p.setStyle(Paint.Style.FILL);
+                this.p.setColor(isPressed() ? 0xEE2A2E38 : 0xE0111318);
+                c.drawCircle(cx, cy, r - (d * 0.6f), this.p);
+            } else if (isPressed()) {
+                this.p.setStyle(Paint.Style.FILL);
+                this.p.setColor(0x33FFFFFF);
+                c.drawCircle(cx, cy, d * 16.0f, this.p);
+            }
             this.p.setStyle(Paint.Style.FILL);
             this.p.setColor(-1);
             switch (this.kind) {
                 case 0:
-                    this.p.setStyle(Paint.Style.STROKE);
-                    this.p.setStrokeWidth(this.this$0.d * 2.6f);
+                    // Official Roblox tilted solid square with inner cutout (matching 82314.png)
                     c.save();
-                    c.rotate(15.0f, cx, cy);
-                    float s = this.this$0.d * 8.0f;
-                    c.drawRoundRect(cx - s, cy - s, cx + s, cy + s, this.this$0.d * 2.0f, this.this$0.d * 2.0f, this.p);
+                    c.rotate(14.5f, cx, cy);
+                    float s = d * 10.2f;
                     this.p.setStyle(Paint.Style.FILL);
-                    c.drawRect(cx - (this.this$0.d * 2.2f), cy - (this.this$0.d * 2.2f), (this.this$0.d * 2.2f) + cx, (this.this$0.d * 2.2f) + cy, this.p);
+                    this.p.setColor(-1);
+                    c.drawRoundRect(cx - s, cy - s, cx + s, cy + s, d * 1.6f, d * 1.6f, this.p);
+                    this.p.setColor(0xFF111318);
+                    float h = d * 3.1f;
+                    c.drawRect(cx - h, cy - h, cx + h, cy + h, this.p);
                     c.restore();
                     break;
                 case 1:
-                    if (!this.active) {
-                        this.p.setAlpha(150);
-                    }
-                    c.drawRoundRect(cx - (this.this$0.d * 9.0f), cy - (this.this$0.d * 7.0f), (this.this$0.d * 9.0f) + cx, (this.this$0.d * 5.0f) + cy, this.this$0.d * 4.0f, this.this$0.d * 4.0f, this.p);
-                    Path path = new Path();
-                    PlayHud playHud = this.this$0;
-                    path.moveTo(cx - (playHud.d * 4.0f), (playHud.d * 4.0f) + cy);
-                    path.lineTo(cx - (playHud.d * 6.0f), (playHud.d * 10.0f) + cy);
-                    path.lineTo((playHud.d * 1.0f) + cx, (playHud.d * 4.0f) + cy);
-                    path.close();
-                    c.drawPath(path, this.p);
+                    // Outlined Roblox chat bubble with two interior lines (matching 82314.png)
+                    this.p.setAlpha(this.active ? 255 : 155);
+                    this.p.setStyle(Paint.Style.STROKE);
+                    this.p.setStrokeWidth(d * 1.7f);
+                    this.p.setStrokeCap(Paint.Cap.ROUND);
+                    this.p.setStrokeJoin(Paint.Join.ROUND);
+                    c.drawRoundRect(cx - (d * 8.2f), cy - (d * 6.8f), cx + (d * 8.2f), cy + (d * 4.6f), d * 2.5f, d * 2.5f, this.p);
+                    c.drawLine(cx - (d * 4.2f), cy - (d * 2.4f), cx + (d * 4.2f), cy - (d * 2.4f), this.p);
+                    c.drawLine(cx - (d * 4.2f), cy + (d * 1.0f), cx + (d * 1.5f), cy + (d * 1.0f), this.p);
+                    c.drawLine(cx - (d * 2.0f), cy + (d * 4.8f), cx, cy + (d * 8.0f), this.p);
+                    c.drawLine(cx, cy + (d * 8.0f), cx + (d * 2.5f), cy + (d * 4.8f), this.p);
+                    this.p.setStyle(Paint.Style.FILL);
                     this.p.setAlpha(255);
+                    if (this.this$0.unreadChat) {
+                        float bx = cx + (d * 7.2f);
+                        float by = cy - (d * 6.5f);
+                        this.p.setColor(0xFFFFFFFF);
+                        c.drawCircle(bx, by, d * 4.2f, this.p);
+                        this.p.setColor(0xFFE53935);
+                        c.drawCircle(bx, by, d * 3.0f, this.p);
+                        this.p.setColor(-1);
+                    }
+                    break;
+                case 3:
+                    // Hamburger menu (3 crisp horizontal lines matching 82314.png)
+                    this.p.setStyle(Paint.Style.STROKE);
+                    this.p.setStrokeWidth(d * 1.85f);
+                    this.p.setStrokeCap(Paint.Cap.ROUND);
+                    c.drawLine(cx - (d * 7.8f), cy - (d * 5.2f), cx + (d * 7.8f), cy - (d * 5.2f), this.p);
+                    c.drawLine(cx - (d * 7.8f), cy, cx + (d * 7.8f), cy, this.p);
+                    c.drawLine(cx - (d * 7.8f), cy + (d * 5.2f), cx + (d * 7.8f), cy + (d * 5.2f), this.p);
+                    this.p.setStyle(Paint.Style.FILL);
+                    break;
+                case 4:
+                    // Microphone / Voice toggle with diagonal slash when muted (matching 82314.png)
+                    this.p.setStyle(Paint.Style.STROKE);
+                    this.p.setStrokeWidth(d * 1.65f);
+                    this.p.setStrokeCap(Paint.Cap.ROUND);
+                    c.drawRoundRect(cx - (d * 3.4f), cy - (d * 8.0f), cx + (d * 3.4f), cy + (d * 1.2f), d * 3.4f, d * 3.4f, this.p);
+                    c.drawArc(cx - (d * 6.2f), cy - (d * 3.5f), cx + (d * 6.2f), cy + (d * 4.8f), 0.0f, 180.0f, false, this.p);
+                    c.drawLine(cx, cy + (d * 4.8f), cx, cy + (d * 8.2f), this.p);
+                    c.drawLine(cx - (d * 3.2f), cy + (d * 8.2f), cx + (d * 3.2f), cy + (d * 8.2f), this.p);
+                    if (!this.active) {
+                        c.drawLine(cx - (d * 7.2f), cy + (d * 7.2f), cx + (d * 7.2f), cy - (d * 7.2f), this.p);
+                    }
+                    this.p.setStyle(Paint.Style.FILL);
                     break;
                 default:
                     if (!this.active) {
@@ -691,8 +955,8 @@ public final class PlayHud extends FrameLayout {
             float fDp2 = this.this$0.dp(150.0f);
             float size = (listLeaderstats.size() * fDp) + fDp2 + this.this$0.dp(16.0f);
             float fDp3 = this.this$0.dp(32.0f);
-            float width = (getWidth() - size) - this.this$0.dp(12.0f);
-            float fDp4 = this.this$0.dp(56.0f);
+            float width = (getWidth() - size) - (this.this$0.dp(12.0f) + this.this$0.cutR);
+            float fDp4 = this.this$0.dp(58.0f) + this.this$0.cutT;
             this.fill.setColor(Integer.MIN_VALUE);
             c.drawRoundRect(width, fDp4, width + size, (((!listLeaderstats.isEmpty() ? 1 : 0) + 1) * fDp3) + fDp4 + this.this$0.dp(8.0f), this.this$0.dp(8.0f), this.this$0.dp(8.0f), this.fill);
             float fDp5 = fDp4 + this.this$0.dp(4.0f);
@@ -796,8 +1060,8 @@ public final class PlayHud extends FrameLayout {
             float f2 = RangesKt.coerceIn(hp / max, 0.0f, 1.0f);
             float w = this.this$0.dp(120.0f);
             float h = this.this$0.dp(8.0f);
-            float x = (getWidth() - w) - this.this$0.dp(64.0f);
-            float y = this.this$0.dp(24.0f);
+            float x = (getWidth() - w) - (this.this$0.dp(12.0f) + this.this$0.cutR);
+            float y = this.this$0.dp(20.0f) + this.this$0.cutT;
             this.fill.setColor(Integer.MIN_VALUE);
             c.drawRoundRect(x, y, x + w, y + h, h / 2.0f, h / 2.0f, this.fill);
             Paint paint = this.fill;
@@ -884,6 +1148,11 @@ public final class PlayHud extends FrameLayout {
     }
 
     private final void openMenu() {
+        openMenu(0);
+    }
+
+    private final void openMenu(int initialTab) {
+        closeExpDropdown();
         hideKeyboard();
         final FrameLayout root = new FrameLayout(getContext());
         root.setBackgroundColor(-1291845632);
@@ -964,7 +1233,7 @@ public final class PlayHud extends FrameLayout {
         root.addView(panel, new FrameLayout.LayoutParams(Math.min(maxW, RangesKt.coerceAtLeast((int) (getWidth() * 0.94f), dp(280.0f))), (int) (getHeight() * 0.9f), 17));
         addView(root, new FrameLayout.LayoutParams(-1, -1));
         this.menu = root;
-        openMenu$select(tabViews, content, this, 0);
+        openMenu$select(tabViews, content, this, initialTab);
     }
 
     /* JADX INFO: Access modifiers changed from: private */
@@ -1333,7 +1602,7 @@ public final class PlayHud extends FrameLayout {
         LinearLayout box = new LinearLayout(getContext());
         box.setOrientation(1);
         box.setPadding(dp(6.0f), dp(4.0f), dp(6.0f), dp(4.0f));
-        for (Pair pair : CollectionsKt.listOf(new Pair[]{TuplesKt.to("Move", "Drag the thumbstick (bottom left). Keyboard: WASD or arrow keys"), TuplesKt.to("Look around", "Drag anywhere else on the screen. Keyboard: ← → to turn"), TuplesKt.to("Zoom", "Pinch with two fingers. Keyboard: I / O"), TuplesKt.to("Jump", "Jump button (bottom right). Keyboard: Space"), TuplesKt.to("Shift lock", "Lock button above jump. Keyboard: Shift"), TuplesKt.to("Chat", "Chat button (top left). Keyboard: /"), TuplesKt.to("Tools", "Tap a slot at the bottom. Keyboard: 1–9"), TuplesKt.to("Menu", "Roblox button (top left). Keyboard: Esc")})) {
+        for (Pair pair : CollectionsKt.listOf(new Pair[]{TuplesKt.to("Move", "Drag the thumbstick (bottom left). Keyboard: WASD or arrow keys"), TuplesKt.to("Look around", "Drag anywhere else on the screen. Keyboard: ← → to turn"), TuplesKt.to("Zoom", "Pinch with two fingers. Keyboard: I / O"), TuplesKt.to("Jump", "Jump button (bottom right). Keyboard: Space"), TuplesKt.to("Shift lock", "Lock button left of jump. Keyboard: Left/Right Shift"), TuplesKt.to("Chat", "Chat button (top left). Keyboard: /"), TuplesKt.to("Leaderboard", "Experience controls (≡) → Leaderboard. Keyboard: Tab"), TuplesKt.to("Tools", "Tap a slot at the bottom. Keyboard: 1–0, Backspace to unequip"), TuplesKt.to("Menu", "Roblox button (top left). Keyboard: Esc")})) {
             String k = (String) pair.component1();
             String v = (String) pair.component2();
             TextView textViewLabel$default = label$default(this, k, 15.0f, 0, true, 4, null);

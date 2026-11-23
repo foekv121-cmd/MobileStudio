@@ -306,6 +306,7 @@ public final class MainActivity extends AppCompatActivity implements MainActions
         StudioApp.logBreadcrumb("MainActivity.onCreate started");
         try {
             com.goydevv.studrblx.net.AssetFetcher.INSTANCE.init(getApplicationContext());
+            com.goydevv.studrblx.audio.AudioEngine.INSTANCE.init(getApplicationContext());
             long[] warmAnims = new long[]{507766666L, 507766951L, 913402848L, 913376220L, 507765000L, 507767968L, 507765644L, 180435571L, 180435792L, 180426354L, 125750702L, 180436148L, 180436334L};
             for (long aid : warmAnims) {
                 com.goydevv.studrblx.engine.AnimLibrary.INSTANCE.get(aid);
@@ -643,6 +644,71 @@ public final class MainActivity extends AppCompatActivity implements MainActions
         showSettings();
     }
 
+    @Override // com.goydevv.studrblx.ui.StartScreen.Host
+    public void duplicateRecentFile(Recents.Entry e) {
+        Intrinsics.checkNotNullParameter(e, "e");
+        String uriStr = e.getUri();
+        if (uriStr == null) {
+            return;
+        }
+        Uri uri = Uri.parse(uriStr);
+        byte[] bytes;
+        try {
+            InputStream in = getContentResolver().openInputStream(uri);
+            if (in == null) {
+                Toast.makeText(this, "Couldn't open file to duplicate.", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            try {
+                java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) >= 0) {
+                    bos.write(buf, 0, n);
+                }
+                bytes = bos.toByteArray();
+            } finally {
+                in.close();
+            }
+        } catch (Exception ex) {
+            Toast.makeText(this, "Couldn't read file: " + ex.getMessage(), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final byte[] copyBytes = bytes;
+        this.pendingSave = new Function0<byte[]>() {
+            @Override
+            public byte[] invoke() {
+                return copyBytes;
+            }
+        };
+        this.pendingSaveIsPlace = true;
+        String origName = e.getName();
+        String lower = origName.toLowerCase(Locale.ROOT);
+        String ext = lower.endsWith(".rbxlx") ? ".rbxlx" : ".rbxl";
+        String base = StringsKt.removeSuffix(StringsKt.removeSuffix(origName, (CharSequence) ".rbxl"), (CharSequence) ".rbxlx");
+        this.createLauncher.launch(base + " (Copy)" + ext);
+    }
+
+    @Override // com.goydevv.studrblx.ui.StartScreen.Host
+    public void shareRecentFile(Recents.Entry e) {
+        Intrinsics.checkNotNullParameter(e, "e");
+        String uriStr = e.getUri();
+        if (uriStr == null) {
+            return;
+        }
+        try {
+            Uri uri = Uri.parse(uriStr);
+            Intent intent = new Intent(Intent.ACTION_SEND);
+            intent.setType("application/octet-stream");
+            intent.putExtra(Intent.EXTRA_STREAM, uri);
+            intent.putExtra(Intent.EXTRA_TITLE, e.getName());
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(intent, "Share " + e.getName()));
+        } catch (Exception ex) {
+            Toast.makeText(this, "Couldn't share file: " + ex.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
     /* JADX INFO: Access modifiers changed from: private */
     /* JADX WARN: Code duplicated, block: B:33:0x00a0  */
     public final void refreshAccountChip() {
@@ -923,6 +989,7 @@ public final class MainActivity extends AppCompatActivity implements MainActions
     @Override // androidx.fragment.app.FragmentActivity, android.app.Activity
     protected void onResume() {
         super.onResume();
+        com.goydevv.studrblx.audio.AudioEngine.INSTANCE.onAppResume();
         ViewportView viewportView = this.viewport;
         if (viewportView == null) {
             return;
@@ -933,6 +1000,7 @@ public final class MainActivity extends AppCompatActivity implements MainActions
     @Override // androidx.fragment.app.FragmentActivity, android.app.Activity
     protected void onPause() {
         super.onPause();
+        com.goydevv.studrblx.audio.AudioEngine.INSTANCE.onAppPause();
         ViewportView viewportView = this.viewport;
         if (viewportView == null) {
             return;
@@ -961,6 +1029,7 @@ public final class MainActivity extends AppCompatActivity implements MainActions
 
     @Override // androidx.appcompat.app.AppCompatActivity, androidx.fragment.app.FragmentActivity, android.app.Activity
     protected void onDestroy() {
+        com.goydevv.studrblx.audio.AudioEngine.INSTANCE.onAppDestroy();
         if (this.outTabLogListener != null) {
             OutputLog.INSTANCE.getListeners().remove(this.outTabLogListener);
             this.outTabLogListener = null;
@@ -7212,6 +7281,7 @@ public final class MainActivity extends AppCompatActivity implements MainActions
                             }                        }
                         return true;
                     case 59:
+                    case 60:
                         Studio studio41 = this.studio;
                         if (studio41 == null) {
                             Intrinsics.throwUninitializedPropertyAccessException("studio");
@@ -7239,6 +7309,25 @@ public final class MainActivity extends AppCompatActivity implements MainActions
                         }
                         viewportView3.getHud().togglePlayerList();
                         return true;
+                    case 67:
+                        Studio studioUnequipLock = this.studio;
+                        if (studioUnequipLock == null) {
+                            Intrinsics.throwUninitializedPropertyAccessException("studio");
+                            studioUnequipLock = null;
+                        }
+                        synchronized (studioUnequipLock.getLock()) {
+                            Studio studioUnequip = this.studio;
+                            if (studioUnequip == null) {
+                                Intrinsics.throwUninitializedPropertyAccessException("studio");
+                                studioUnequip = null;
+                            }
+                            PlaySession playUnequip = studioUnequip.getPlay();
+                            if (playUnequip != null) {
+                                playUnequip.unequip();
+                                Unit unitUnequip = Unit.INSTANCE;
+                            }
+                        }
+                        return true;
                     case 76:
                         ViewportView viewportView6 = this.viewport;
                         if (viewportView6 == null) {
@@ -7258,7 +7347,8 @@ public final class MainActivity extends AppCompatActivity implements MainActions
                         viewportView.getHud().toggleMenu();
                         return true;
                     default:
-                        if ((8 <= keyCode && keyCode < 17) != false) {
+                        if (keyCode == 7 || (8 <= keyCode && keyCode < 17)) {
+                            int slotIdx = keyCode == 7 ? 9 : (keyCode - 8);
                             Studio studio43 = this.studio;
                             if (studio43 == null) {
                                 Intrinsics.throwUninitializedPropertyAccessException("studio");
@@ -7272,10 +7362,11 @@ public final class MainActivity extends AppCompatActivity implements MainActions
                                     studio14 = studio44;
                                 }
                                 PlaySession play4 = studio14.getPlay();
-                                if (play4 != null && (listBackpackTools = play4.backpackTools()) != null && (instance = (Instance) CollectionsKt.getOrNull(listBackpackTools, keyCode - 8)) != null) {
+                                if (play4 != null && (listBackpackTools = play4.backpackTools()) != null && (instance = (Instance) CollectionsKt.getOrNull(listBackpackTools, slotIdx)) != null) {
                                     play4.toggleTool(instance);
                                     Unit unit4 = Unit.INSTANCE;
-                                }                            }
+                                }
+                            }
                             return true;
                         }
                         break;
@@ -7380,6 +7471,9 @@ public final class MainActivity extends AppCompatActivity implements MainActions
             }
             return true;
         }
+        if (zIsPlaying && (keyCode == 45 || keyCode == 33)) {
+            return super.dispatchKeyEvent(event);
+        }
         if (!SetsKt.setOf(new Integer[]{51, 29, 47, 32, 45, 33, 19, 20}).contains(Integer.valueOf(keyCode)) || event.isCtrlPressed()) {
             return super.dispatchKeyEvent(event);
         }
@@ -7395,18 +7489,20 @@ public final class MainActivity extends AppCompatActivity implements MainActions
             studio54 = null;
         }
         studio54.setMoveY(RangesKt.coerceAtMost(dispatchKeyEvent$k(this, 47) + dispatchKeyEvent$k(this, 20), 1.0f) - RangesKt.coerceAtMost(dispatchKeyEvent$k(this, 51) + dispatchKeyEvent$k(this, 19), 1.0f));
-        Studio studio55 = this.studio;
-        if (studio55 == null) {
-            Intrinsics.throwUninitializedPropertyAccessException("studio");
-            studio55 = null;
+        if (!zIsPlaying) {
+            Studio studio55 = this.studio;
+            if (studio55 == null) {
+                Intrinsics.throwUninitializedPropertyAccessException("studio");
+                studio55 = null;
+            }
+            studio55.setFlyUp(this.keysDown.contains(33));
+            Studio studio56 = this.studio;
+            if (studio56 == null) {
+                Intrinsics.throwUninitializedPropertyAccessException("studio");
+                studio56 = null;
+            }
+            studio56.setFlyDown(this.keysDown.contains(45));
         }
-        studio55.setFlyUp(this.keysDown.contains(33));
-        Studio studio56 = this.studio;
-        if (studio56 == null) {
-            Intrinsics.throwUninitializedPropertyAccessException("studio");
-            studio56 = null;
-        }
-        studio56.setFlyDown(this.keysDown.contains(45));
         return true;
     }
 

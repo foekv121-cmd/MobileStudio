@@ -250,6 +250,56 @@ public final class LuauTranspiler {
     /* JADX WARN: Code duplicated, block: B:148:0x007a A[SYNTHETIC] */
     /* JADX WARN: Code duplicated, block: B:32:0x008c  */
     /* JADX WARN: Code duplicated, block: B:66:0x0158  */
+    private static String rewriteStringEscapes(String lit) {
+        int len = lit.length();
+        StringBuilder sb = new StringBuilder(len);
+        int i = 0;
+        while (i < len) {
+            char ch = lit.charAt(i);
+            if (ch == '\\' && i + 1 < len) {
+                char nxt = lit.charAt(i + 1);
+                if (nxt == '\\') {
+                    sb.append("\\\\");
+                    i += 2;
+                } else if (nxt == 'z') {
+                    i += 2;
+                    while (i < len - 1) {
+                        char wc = lit.charAt(i);
+                        if (wc == ' ' || wc == '\t' || wc == '\n' || wc == '\r' || wc == '\f' || wc == 0x0B) {
+                            i++;
+                        } else {
+                            break;
+                        }
+                    }
+                } else if (nxt == 'u' && i + 2 < len && lit.charAt(i + 2) == '{') {
+                    int close = lit.indexOf('}', i + 3);
+                    if (close > i + 3) {
+                        String hex = lit.substring(i + 3, close);
+                        try {
+                            int cp = Integer.parseInt(hex, 16);
+                            byte[] utf8Bytes = new String(Character.toChars(cp)).getBytes(kotlin.text.Charsets.UTF_8);
+                            for (byte b : utf8Bytes) {
+                                sb.append(String.format(java.util.Locale.US, "\\%03d", b & 0xFF));
+                            }
+                            i = close + 1;
+                            continue;
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    sb.append(ch).append(nxt);
+                    i += 2;
+                } else {
+                    sb.append(ch).append(nxt);
+                    i += 2;
+                }
+            } else {
+                sb.append(ch);
+                i++;
+            }
+        }
+        return sb.toString();
+    }
+
     private final ArrayList<Tok> lex(String s) {
         ArrayList<Tok> arrayList = new ArrayList<>();
         int lvl = 0;
@@ -313,7 +363,7 @@ public final class LuauTranspiler {
                         if (j < n && (s.charAt(j) == '+' || s.charAt(j) == '-')) {
                             j++;
                         }
-                        while (j < n && Character.isDigit(s.charAt(j))) {
+                        while (j < n && (Character.isDigit(s.charAt(j)) || s.charAt(j) == '_')) {
                             j++;
                         }
                     }
@@ -335,7 +385,19 @@ public final class LuauTranspiler {
                 int j2 = i2 + 1;
                 while (j2 < n && s.charAt(j2) != c) {
                     if (s.charAt(j2) == '\\') {
-                        j2 += 2;
+                        if (j2 + 1 < n && s.charAt(j2 + 1) == 'z') {
+                            j2 += 2;
+                            while (j2 < n) {
+                                char wc = s.charAt(j2);
+                                if (wc == ' ' || wc == '\t' || wc == '\n' || wc == '\r' || wc == '\f' || wc == 0x0B) {
+                                    j2++;
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else {
+                            j2 += 2;
+                        }
                     } else if (s.charAt(j2) == '\n') {
                         break;
                     } else {
@@ -345,7 +407,11 @@ public final class LuauTranspiler {
                 lvl = Math.min(j2 + 1, n);
                 String strLit = s.substring(i2, lvl);
                 Intrinsics.checkNotNullExpressionValue(strLit, "substring(...)");
-                arrayList.add(new Tok(K.STRING, strLit, tr));
+                Tok strTok = new Tok(K.STRING, strLit, tr);
+                if (strLit.indexOf("\\u{") >= 0 || strLit.indexOf("\\z") >= 0) {
+                    strTok.setOut(rewriteStringEscapes(strLit));
+                }
+                arrayList.add(strTok);
             } else if (c == '[' && lex$longBracketLevel(n, s, i2) >= 0) {
                 int lvl3 = lex$longBracketLevel(n, s, i2);
                 int e2 = lex$skipLong(s, n, i2, lvl3);
@@ -690,6 +756,22 @@ public final class LuauTranspiler {
         }
 
         public final void statement() throws IOException, ParseError {
+            while (peek$default(this, 0, 1, null).isOp("@")) {
+                int attrStart = this.p;
+                next();
+                if (peek$default(this, 0, 1, null).isOp("[")) {
+                    skipBalanced("[", "]");
+                } else if (peek$default(this, 0, 1, null).getK() == K.NAME || peek$default(this, 0, 1, null).getK() == K.KEYWORD) {
+                    next();
+                    if (peek$default(this, 0, 1, null).isOp("(")) {
+                        skipBalanced("(", ")");
+                    }
+                }
+                drop(attrStart, this.p);
+            }
+            if (blockEnd()) {
+                return;
+            }
             Tok k = peek$default(this, 0, 1, null);
             if (!k.isOp(";")) {
                 if (k.isKw("if")) {
@@ -938,6 +1020,13 @@ public final class LuauTranspiler {
                     depth--;
                 } else if (k.isOp(">=")) {
                     depth--;
+                    if (depth == 0) {
+                        int idx = this.p - 1;
+                        Tok gt = new Tok(K.OP, ">", k.getTrivia());
+                        Tok eq = new Tok(K.OP, "=", "");
+                        this.t.set(idx, gt);
+                        this.t.add(idx + 1, eq);
+                    }
                 }
             }
         }
@@ -1063,7 +1152,8 @@ public final class LuauTranspiler {
                 String lhs = CollectionsKt.joinToString(RangesKt.until(start, this.p - 1), " ", "", "", -1, "...", new Function1() { // from class: com.goydevv.studrblx.lua.LuauTranspiler$Parser$$ExternalSyntheticLambda0
                     @Override // kotlin.jvm.functions.Function1
                     public final Object invoke(Object obj) {
-                        return Parser.this.t.get(((Integer) obj).intValue()).getOut();
+                        Tok tok = Parser.this.t.get(((Integer) obj).intValue());
+                        return tok.getPrefix() + tok.getOut() + tok.getSuffix();
                     }
                 });
                 int rhsStart = this.p;
@@ -1182,7 +1272,7 @@ public final class LuauTranspiler {
             } else {
                 suffixedExpr();
             }
-            if (peek$default(this, 0, 1, null).isOp("::")) {
+            while (peek$default(this, 0, 1, null).isOp("::")) {
                 int s = this.p;
                 next();
                 type();

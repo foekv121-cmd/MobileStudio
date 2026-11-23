@@ -31,4 +31,14 @@ public final class SphereShape extends ConvexShape {
         float l = axis.getMagnitude();
         return TuplesKt.to(Float.valueOf(d - (this.r * l)), Float.valueOf((this.r * l) + d));
     }
+
+    @Override // com.goydevv.studrblx.engine.ConvexShape
+    public void project(float ax, float ay, float az, float[] out) {
+        Vector3 c = getCenter();
+        float d = (c.getX() * ax) + (c.getY() * ay) + (c.getZ() * az);
+        float l = (float) Math.sqrt((ax * ax) + (ay * ay) + (az * az));
+        float rl = this.r * l;
+        out[0] = d - rl;
+        out[1] = d + rl;
+    }
 }

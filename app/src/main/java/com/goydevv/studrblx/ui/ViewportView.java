@@ -135,7 +135,7 @@ public final class ViewportView extends FrameLayout {
     static final Unit _init_$lambda$1(final ViewportView this$0) {
         ArrayList<Instance> children;
         long now = System.currentTimeMillis();
-        if (now - this$0.lastOverlay > 33) {
+        if (now - this$0.lastOverlay > (this$0.studio.isPlaying() ? 50L : 80L)) {
             this$0.lastOverlay = now;
             Instance instanceFindService = this$0.studio.getModel().findService("CoreGui");
             boolean core = false;
@@ -262,12 +262,18 @@ public final class ViewportView extends FrameLayout {
     /* JADX INFO: compiled from: ViewportView.kt */
     public final class TouchLayer extends View {
         private final HashMap<String, RectF> buttons;
+        private int cutB;
+        private int cutL;
+        private int cutR;
+        private int cutT;
         private final float d;
+        private float joyAlpha = 0.38f;
         private float joyCx;
         private float joyCy;
         private float joyX;
         private float joyY;
         private boolean jumpDown;
+        private long lastJoyFrameNs = 0L;
         private final Paint paint;
         private float pinchDist;
         private float[] pinchMid;
@@ -745,12 +751,35 @@ public final class ViewportView extends FrameLayout {
             return this.d * 56.0f;
         }
 
+        @Override // android.view.View
+        public android.view.WindowInsets onApplyWindowInsets(android.view.WindowInsets insets) {
+            if (android.os.Build.VERSION.SDK_INT >= 28 && insets != null && insets.getDisplayCutout() != null) {
+                this.cutL = insets.getDisplayCutout().getSafeInsetLeft();
+                this.cutR = insets.getDisplayCutout().getSafeInsetRight();
+                this.cutT = insets.getDisplayCutout().getSafeInsetTop();
+                this.cutB = insets.getDisplayCutout().getSafeInsetBottom();
+            } else {
+                this.cutL = 0;
+                this.cutR = 0;
+                this.cutT = 0;
+                this.cutB = 0;
+            }
+            invalidate();
+            return super.onApplyWindowInsets(insets);
+        }
+
+        private final int scaleAlpha(int argb, float factor) {
+            int a = (argb >>> 24) & 0xFF;
+            int scaled = Math.max(0, Math.min(255, Math.round(a * factor)));
+            return (scaled << 24) | (argb & 0x00FFFFFF);
+        }
+
         private final float getDefaultJoyX() {
-            return (this.d * 40.0f) + getJoyR();
+            return (this.d * 40.0f) + getJoyR() + this.cutL;
         }
 
         private final float getDefaultJoyY() {
-            return (getHeight() - (this.d * 40.0f)) - getJoyR();
+            return ((getHeight() - (this.d * 40.0f)) - getJoyR()) - this.cutB;
         }
 
         private final boolean getActiveJoy() {
@@ -801,16 +830,30 @@ public final class ViewportView extends FrameLayout {
 
         private final void drawThumbstick(Canvas canvas) {
             boolean active = getActiveJoy();
+            boolean dynamicMode = this.this$0.studio.isPlaying() && !getFixedStick();
+            float targetAlpha = (active || !dynamicMode) ? 1.0f : 0.38f;
+            long nowNs = System.nanoTime();
+            float dt = this.lastJoyFrameNs == 0L ? 0.016f : Math.min(0.1f, Math.max(0.0f, (nowNs - this.lastJoyFrameNs) / 1.0e9f));
+            this.lastJoyFrameNs = nowNs;
+            float diff = targetAlpha - this.joyAlpha;
+            if (Math.abs(diff) > 0.01f) {
+                float step = Math.min(1.0f, dt * (active ? 14.0f : 6.0f));
+                this.joyAlpha += diff * step;
+                postInvalidateOnAnimation();
+            } else {
+                this.joyAlpha = targetAlpha;
+            }
+            float alphaScale = dynamicMode ? this.joyAlpha : 1.0f;
             float r = getJoyR();
             float kx = this.joyCx + (this.joyX * r);
             float ky = this.joyCy + (this.joyY * r);
             // Roblox PlayerModule DynamicThumbstick outer ring
             this.paint.setStyle(Paint.Style.FILL);
-            this.paint.setColor(active ? 0x36000000 : 0x24000000);
+            this.paint.setColor(scaleAlpha(active ? 0x36000000 : 0x24000000, alphaScale));
             canvas.drawCircle(this.joyCx, this.joyCy, r, this.paint);
             this.paint.setStyle(Paint.Style.STROKE);
             this.paint.setStrokeWidth(this.d * 1.75f);
-            this.paint.setColor(active ? 0x6EFFFFFF : 0x42FFFFFF);
+            this.paint.setColor(scaleAlpha(active ? 0x6EFFFFFF : 0x42FFFFFF, alphaScale));
             canvas.drawCircle(this.joyCx, this.joyCy, r, this.paint);
             // Roblox DynamicThumbstick middle directional trail dots when dragged
             float mag = (float) Math.hypot(this.joyX, this.joyY);
@@ -819,18 +862,18 @@ public final class ViewportView extends FrameLayout {
                 for (int di = 1; di <= 3; di++) {
                     float frac = di * 0.24f;
                     float dotR = this.d * (2.6f + di * 0.7f);
-                    this.paint.setColor(0x58FFFFFF);
+                    this.paint.setColor(scaleAlpha(0x58FFFFFF, alphaScale));
                     canvas.drawCircle(this.joyCx + (this.joyX * r * frac), this.joyCy + (this.joyY * r * frac), dotR, this.paint);
                 }
             }
             // Inner thumbstick knob (Roblox mobile translucent disc + crisp subtle rim)
             float kr = r * 0.36f;
             this.paint.setStyle(Paint.Style.FILL);
-            this.paint.setColor(active ? 0xC8FFFFFF : 0x78FFFFFF);
+            this.paint.setColor(scaleAlpha(active ? 0xC8FFFFFF : 0x78FFFFFF, alphaScale));
             canvas.drawCircle(kx, ky, kr, this.paint);
             this.paint.setStyle(Paint.Style.STROKE);
             this.paint.setStrokeWidth(this.d * 1.2f);
-            this.paint.setColor(active ? 0xE8FFFFFF : 0x88FFFFFF);
+            this.paint.setColor(scaleAlpha(active ? 0xE8FFFFFF : 0x88FFFFFF, alphaScale));
             canvas.drawCircle(kx, ky, kr, this.paint);
         }
 
@@ -841,8 +884,8 @@ public final class ViewportView extends FrameLayout {
             Canvas canvas2 = canvas;
             drawThumbstick(canvas);
             float jr = this.d * 35.0f;
-            float jx = (getWidth() - (this.d * 24.0f)) - jr;
-            float jy = (getHeight() - (this.d * 24.0f)) - jr;
+            float jx = ((getWidth() - (this.d * 24.0f)) - jr) - this.cutR;
+            float jy = ((getHeight() - (this.d * 24.0f)) - jr) - this.cutB;
             this.paint.setStyle(Paint.Style.FILL);
             this.paint.setColor(this.jumpDown ? 0x88FFFFFF : 0x48000000);
             canvas2.drawCircle(jx, jy, jr, this.paint);
@@ -945,9 +988,10 @@ public final class ViewportView extends FrameLayout {
                 this.text.setTextAlign(Paint.Align.CENTER);
                 this.buttons.put("prompt", rectF);
             }
-            if (play.getCoreBackpack()) {
+            if (play.getCoreBackpack() && this.this$0.getHud().isInventoryOpen()) {
                 synchronized (this.this$0.studio.getLock()) {
-                    listEmptyList = play.backpackTools();
+                    List<Instance> rawTools = play.backpackTools();
+                    listEmptyList = rawTools.size() > 10 ? rawTools.subList(0, 10) : rawTools;
                 }
             } else {
                 listEmptyList = CollectionsKt.emptyList();
@@ -969,7 +1013,8 @@ public final class ViewportView extends FrameLayout {
                     float ay3 = ay2;
                     float ay4 = x + slot2;
                     List<Instance> list = listEmptyList;
-                    RectF rectF2 = new RectF(x, (getHeight() - slot2) - (this.d * 10.0f), ay4, getHeight() - (this.d * 10.0f));
+                    float bottomPad = (this.d * 10.0f) + this.cutB;
+                    RectF rectF2 = new RectF(x, (getHeight() - slot2) - bottomPad, ay4, getHeight() - bottomPad);
                     this.paint.setColor(-1728053248);
                     canvas2.drawRoundRect(rectF2, this.d * 6.0f, this.d * 6.0f, this.paint);
                     if (play.getEquipped() == instance) {
@@ -982,7 +1027,8 @@ public final class ViewportView extends FrameLayout {
                     this.text.setTextSize(this.d * 11.0f);
                     this.text.setTextAlign(Paint.Align.LEFT);
                     this.text.setFakeBoldText(false);
-                    canvas2.drawText(String.valueOf(i + 1), rectF2.left + (this.d * 5.0f), rectF2.top + (this.d * 13.0f), this.text);
+                    String slotLabel = i == 9 ? "0" : String.valueOf(i + 1);
+                    canvas2.drawText(slotLabel, rectF2.left + (this.d * 5.0f), rectF2.top + (this.d * 13.0f), this.text);
                     this.text.setTextAlign(Paint.Align.CENTER);
                     this.text.setFakeBoldText(true);
                     canvas2.drawText(StringsKt.take(instance.getName(), 9), rectF2.centerX(), rectF2.centerY() + (this.d * 8.0f), this.text);
@@ -1300,8 +1346,8 @@ public final class ViewportView extends FrameLayout {
             boolean inStickArea = z2;
             if (!getActiveJoy() && inStickArea && (!playing || !this.this$0.getGui().blocksAt(x, y))) {
                 if (!getFixedStick()) {
-                    this.joyCx = RangesKt.coerceAtLeast(x, getJoyR() * 0.6f);
-                    this.joyCy = RangesKt.coerceAtMost(y, getHeight() - (getJoyR() * 0.6f));
+                    this.joyCx = RangesKt.coerceAtLeast(x, (getJoyR() * 0.6f) + this.cutL);
+                    this.joyCy = RangesKt.coerceAtMost(y, (getHeight() - (getJoyR() * 0.6f)) - this.cutB);
                 }
                 this.ptrs.put(Integer.valueOf(id), new Joy(id, x, y));
                 setJoy(x, y);
@@ -1664,11 +1710,18 @@ public final class ViewportView extends FrameLayout {
                 }
                 dx /= m;
                 dy /= m;
+                m = 1.0f;
             }
             this.joyX = dx;
             this.joyY = dy;
-            this.this$0.studio.setMoveX(dx);
-            this.this$0.studio.setMoveY(dy);
+            if (m < 0.12f) {
+                this.this$0.studio.setMoveX(0.0f);
+                this.this$0.studio.setMoveY(0.0f);
+            } else {
+                float scaled = (m - 0.12f) / 0.88f;
+                this.this$0.studio.setMoveX((dx / m) * scaled);
+                this.this$0.studio.setMoveY((dy / m) * scaled);
+            }
         }
 
         private final void pressButton(String name, boolean down) {
