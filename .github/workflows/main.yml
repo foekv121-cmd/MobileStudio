@@ -1,0 +1,396 @@
+name: Build Modified APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-debug:
+    name: Build and sign modified APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Apply my changes (Aurora look, open buttons, mesh errors, stretchy balls, animation fix, quick publish, UI redesign)
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import sys, re
+          from pathlib import Path
+
+          BASE = Path("app/src/main/java/com/goydevv/studrblx")
+
+          def edit(rel, old, new, count=1):
+              p = BASE / rel
+              s = p.read_text(encoding="utf-8")
+              n = s.count(old)
+              if n != count:
+                  sys.exit("PATCH FAILED: %s expected %d match(es) of %r but found %d" % (rel, count, old[:70], n))
+              p.write_text(s.replace(old, new), encoding="utf-8")
+              print("ok:", rel, "-", old[:50].strip())
+
+          # 1) New "Aurora" theme, listed first.
+          edit("core/Theme.java",
+           "    private static final List<Theme> builtIn = CollectionsKt.listOf(new Theme[]{DARK, LIGHT, MIDNIGHT, HIGH_CONTRAST});",
+           "    private static final Theme AURORA = new Theme(\"Aurora\", false, 0xFF0F1117, 0xFF151923, 0xFF1C2130, 0xFF0B0D13, 0xFF181C28, 0xFF2A3145, 0xFFF1F4FB, 0xFF8F99B1, 0xFF5B8DEF, 0xFF2A4C94, 0xFF232A3C, 0xFF0D1018, 0xFF131722, 0xFF0C0E14, 0xFF121521, 0xFFE6EAF2, -496260, -5377643, -14848, -8750470, -8071433);\n"
+           "    private static final List<Theme> builtIn = CollectionsKt.listOf(new Theme[]{AURORA, DARK, LIGHT, MIDNIGHT, HIGH_CONTRAST});")
+
+          # 2) Aurora is the default theme (was High Contrast).
+          edit("core/Settings.java",
+           'return s("theme", "High Contrast");',
+           'return s("theme", "Aurora");')
+
+          # 3) Rounder buttons, tabs and input fields.
+          edit("ui/Ui.java", "f = 4.0f;", "f = 10.0f;")
+          edit("ui/Ui.java", "setCornerRadius(INSTANCE.dp(ctx, 3.0f))", "setCornerRadius(INSTANCE.dp(ctx, 8.0f))", count=2)
+
+          # 4) Show the reason when a Roblox asset (mesh) fails to download.
+          edit("net/AssetFetcher.java",
+           "            concurrentHashMap.put(lValueOf, message);",
+           "            String prevErr = concurrentHashMap.put(lValueOf, message);\n"
+           "            if (!message.equals(prevErr)) {\n"
+           "                com.goydevv.studrblx.core.OutputLog.INSTANCE.warn(\"Asset \" + $id + \" download failed: \" + message);\n"
+           "            }")
+
+          # 5) Start screen: recolour to the Aurora palette (it had its own hardcoded grey colours).
+          SS = "ui/StartScreen.java"
+          for old, new in [
+              ("COL_CANVAS = 0xFF1F2024;", "COL_CANVAS = 0xFF0F1117;"),
+              ("COL_TOPBAR = 0xFF353535;", "COL_TOPBAR = 0xFF171B27;"),
+              ("COL_DIVIDER = 0xFF292A2E;", "COL_DIVIDER = 0xFF232A3C;"),
+              ("COL_CARD = 0xFF2C2D32;", "COL_CARD = 0xFF1A1F2E;"),
+              ("COL_NAV_ACTIVE = 0xFF000000;", "COL_NAV_ACTIVE = 0xFF222B45;"),
+              ("COL_CTA_BLUE = 0xFF3E65F5;", "COL_CTA_BLUE = 0xFF5B8DEF;"),
+              ("COL_PLUS_BLUE = 0xFF4769E1;", "COL_PLUS_BLUE = 0xFF5B8DEF;"),
+              ("COL_SEE_ALL_BG = 0xFF202125;", "COL_SEE_ALL_BG = 0xFF141824;"),
+              ("COL_SEE_ALL_BORDER = 0xFF303135;", "COL_SEE_ALL_BORDER = 0xFF2A3145;"),
+              ("COL_SEE_ALL_TEXT = 0xFF949599;", "COL_SEE_ALL_TEXT = 0xFF8F99B1;"),
+              ("COL_BADGE_BG = 0xFF050508;", "COL_BADGE_BG = 0xFF0B0D13;"),
+              ("COL_TEXT_PRIMARY = 0xFFEBECEE;", "COL_TEXT_PRIMARY = 0xFFF1F4FB;"),
+              ("COL_TEXT_CARD = 0xFFCBCCD0;", "COL_TEXT_CARD = 0xFFD3D8E6;"),
+              ("COL_TEXT_SECONDARY = 0xFF9C9DA1;", "COL_TEXT_SECONDARY = 0xFF9AA3BA;"),
+              ("COL_TEXT_MUTED = 0xFF75767B;", "COL_TEXT_MUTED = 0xFF6F7992;"),
+              ("COL_TEXT_OWNER = 0xFF727378;", "COL_TEXT_OWNER = 0xFF6F7992;"),
+              ("0xFF2B2B2E, 14.0f", "0xFF1C2130, 14.0f"),
+          ]:
+              edit(SS, old, new)
+
+          # 6) Start screen: show "Open File..." and "Open by Place ID..." as visible menu items.
+          edit(SS,
+           "        }\n    }\n\n    private final void addNavItem(String label, String icon, boolean selected, final Function0<Unit> onClick) {",
+           "        }\n"
+           "        addNavItem(\"Open File\\u2026\", \"Folder\", false, new Function0<Unit>() {\n"
+           "            @Override\n"
+           "            public Unit invoke() {\n"
+           "                StartScreen.this.host.openFileFromStart();\n"
+           "                return Unit.INSTANCE;\n"
+           "            }\n"
+           "        });\n"
+           "        addNavItem(\"Open by Place ID\\u2026\", \"Place\", false, new Function0<Unit>() {\n"
+           "            @Override\n"
+           "            public Unit invoke() {\n"
+           "                AccountUi.INSTANCE.openById(StartScreen.this.act, StartScreen.this.studio, StartScreen.this.actions);\n"
+           "                return Unit.INSTANCE;\n"
+           "            }\n"
+           "        });\n"
+           "    }\n\n    private final void addNavItem(String label, String icon, boolean selected, final Function0<Unit> onClick) {")
+
+          # 7) Ball parts stretch to their full Size (ellipsoid) instead of forcing the smallest side on all three.
+          edit("render/SceneRenderer.java",
+           "            case 0:\n"
+           "                float d = Math.min(size.getX(), Math.min(size.getY(), size.getZ()));\n"
+           "                s = new Vector3(d, d, d);\n"
+           "                break;\n"
+           "            case 1:\n"
+           "            default:\n"
+           "                s = size;\n",
+           "            case 0:\n"
+           "            case 1:\n"
+           "            default:\n"
+           "                s = size;\n")
+
+          QUICK_PUBLISH_JAVA = r'''package com.goydevv.studrblx.ui;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.Context;
+          import android.database.Cursor;
+          import android.graphics.drawable.GradientDrawable;
+          import android.net.Uri;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.OpenableColumns;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import androidx.activity.result.ActivityResultLauncher;
+          import com.goydevv.studrblx.core.OutputLog;
+          import com.goydevv.studrblx.net.AuthRequiredException;
+          import com.goydevv.studrblx.net.RobloxApi;
+          import com.goydevv.studrblx.net.RobloxCloud;
+          import java.io.ByteArrayOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import kotlin.Pair;
+          import kotlin.Unit;
+          import kotlin.jvm.functions.Function1;
+
+          /**
+           * Quick Publish: pick a local .rbxl / .rbxlx and send it straight to Roblox,
+           * without loading it into the 3D viewport.
+           *  - Update Game:     Open Cloud  POST /universes/v1/{universeId}/places/{placeId}/versions?versionType=Published  (x-api-key)
+           *  - Create New Game: .ROBLOSECURITY cookie + x-csrf-token (handled by RobloxCloud.authed)
+           */
+          public final class QuickPublish {
+              /** Set by MainActivity; opens the system file picker. */
+              public static ActivityResultLauncher<String[]> launcher;
+
+              private static final Handler MAIN = new Handler(Looper.getMainLooper());
+              private static final int MAX_BYTES = 100 * 1024 * 1024;
+              private static Uri pickedUri;
+              private static String pickedName = "";
+              private static Runnable pickedListener;
+
+              private QuickPublish() {
+              }
+
+              public static void onPicked(Activity act, Uri uri) {
+                  if (uri == null) {
+                      return;
+                  }
+                  pickedUri = uri;
+                  pickedName = displayName(act, uri);
+                  OutputLog.INSTANCE.info("Quick Publish: selected " + pickedName);
+                  if (pickedListener != null) {
+                      pickedListener.run();
+                  }
+              }
+
+              private static String displayName(Context ctx, Uri uri) {
+                  try (Cursor c = ctx.getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                      if (c != null && c.moveToFirst()) {
+                          String n = c.getString(0);
+                          if (n != null && n.length() > 0) {
+                              return n;
+                          }
+                      }
+                  } catch (Exception ignored) {
+                  }
+                  String p = uri.getLastPathSegment();
+                  return p != null ? p : uri.toString();
+              }
+
+              private static byte[] readAll(Context ctx, Uri uri) throws IOException {
+                  try (InputStream in = ctx.getContentResolver().openInputStream(uri)) {
+                      if (in == null) {
+                          throw new IOException("Couldn't open the selected file.");
+                      }
+                      ByteArrayOutputStream out = new ByteArrayOutputStream(1 << 20);
+                      byte[] buf = new byte[64 * 1024];
+                      int n;
+                      while ((n = in.read(buf)) != -1) {
+                          out.write(buf, 0, n);
+                          if (out.size() > MAX_BYTES) {
+                              throw new IOException("File is larger than 100 MB, which Roblox won't accept.");
+                          }
+                      }
+                      return out.toByteArray();
+                  }
+              }
+
+              private static boolean looksLikePlace(byte[] b) {
+                  int n = Math.min(b.length, 96);
+                  String head = new String(b, 0, n, java.nio.charset.StandardCharsets.ISO_8859_1);
+                  return head.contains("<roblox");
+              }
+
+              private static long parseId(String s) {
+                  try {
+                      String t = s.trim();
+                      return t.length() == 0 ? 0L : Long.parseLong(t);
+                  } catch (NumberFormatException e) {
+                      return -1L;
+                  }
+              }
+
+              private static String describe(Throwable t) {
+                  StringBuilder sb = new StringBuilder();
+                  Throwable cur = t;
+                  int depth = 0;
+                  while (cur != null && depth < 4) {
+                      if (depth > 0) {
+                          sb.append("\n  caused by: ");
+                      }
+                      sb.append(cur.getClass().getSimpleName());
+                      if (cur.getMessage() != null) {
+                          sb.append(": ").append(cur.getMessage());
+                      }
+                      cur = cur.getCause() == cur ? null : cur.getCause();
+                      depth++;
+                  }
+                  if (t instanceof AuthRequiredException) {
+                      sb.append("\nCheck the API key / .ROBLOSECURITY cookie and try again.");
+                  }
+                  return sb.toString();
+              }
+
+              private static void styleSeg(Context c, TextView t, boolean on) {
+                  GradientDrawable g = new GradientDrawable();
+                  g.setCornerRadius(Ui.INSTANCE.dp(c, 10.0f));
+                  g.setColor(on ? Ui.INSTANCE.getACCENT() : Ui.INSTANCE.getHOVER());
+                  t.setBackground(g);
+                  t.setTextColor(on ? 0xFFFFFFFF : Ui.INSTANCE.getDIM());
+              }
+
+              private static TextView label(Context c, String s) {
+                  TextView t = Ui.INSTANCE.text(c, s, 12.0f, Ui.INSTANCE.getDIM(), true);
+                  t.setPadding(0, Ui.INSTANCE.dp(c, 12.0f), 0, Ui.INSTANCE.dp(c, 4.0f));
+                  return t;
+              }
+
+              private static void secret(EditText e) {
+                  e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+              }
+
+              public static void show(final Activity act) {
+                  final Ui ui = Ui.INSTANCE;
+                  pickedUri = null;
+                  pickedName = "";
+
+                  final LinearLayout root = new LinearLayout(act);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(ui.dp(act, 18.0f), ui.dp(act, 14.0f), ui.dp(act, 18.0f), ui.dp(act, 6.0f));
+
+                  root.addView(ui.text(act, "Quick Publish", 18.0f, ui.getTEXT(), true));
+                  TextView sub = ui.text(act, "Send a .rbxl straight to Roblox. The file is not opened in the 3D viewport.", 12.0f, ui.getDIM(), false);
+                  sub.setSingleLine(false);
+                  sub.setPadding(0, ui.dp(act, 2.0f), 0, ui.dp(act, 8.0f));
+                  root.addView(sub);
+
+                  // File picker row
+                  root.addView(label(act, "FILE"));
+                  final TextView fileLabel = ui.text(act, "No file chosen", 13.0f, ui.getTEXT(), false);
+                  fileLabel.setSingleLine(false);
+                  root.addView(fileLabel);
+                  TextView chooseBtn = ui.button(act, "Choose .rbxl file\u2026", ui.getHOVER(), new Function1<View, Unit>() {
+                      @Override
+                      public Unit invoke(View v) {
+                          if (launcher == null) {
+                              Toast.makeText(act, "File picker isn't ready yet.", Toast.LENGTH_SHORT).show();
+                          } else {
+                              launcher.launch(new String[]{"*/*"});
+                          }
+                          return Unit.INSTANCE;
+                      }
+                  });
+                  LinearLayout.LayoutParams chooseLp = new LinearLayout.LayoutParams(-1, -2);
+                  chooseLp.topMargin = ui.dp(act, 6.0f);
+                  root.addView(chooseBtn, chooseLp);
+                  pickedListener = new Runnable() {
+                      @Override
+                      public void run() {
+                          fileLabel.setText(pickedName);
+                      }
+                  };
+
+                  // Mode switch
+                  root.addView(label(act, "MODE"));
+                  LinearLayout seg = new LinearLayout(act);
+                  seg.setOrientation(LinearLayout.HORIZONTAL);
+                  final TextView segUpdate = ui.text(act, "Update Game", 13.0f, ui.getTEXT(), true);
+                  final TextView segCreate = ui.text(act, "Create New Game", 13.0f, ui.getTEXT(), true);
+                  for (TextView t : new TextView[]{segUpdate, segCreate}) {
+                      t.setGravity(Gravity.CENTER);
+                      t.setPadding(0, ui.dp(act, 11.0f), 0, ui.dp(act, 11.0f));
+                  }
+                  LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(0, -2, 1.0f);
+                  l1.rightMargin = ui.dp(act, 4.0f);
+                  seg.addView(segUpdate, l1);
+                  seg.addView(segCreate, new LinearLayout.LayoutParams(0, -2, 1.0f));
+                  root.addView(seg);
+
+                  // Update Game fields
+                  final LinearLayout updateBox = new LinearLayout(act);
+                  updateBox.setOrientation(LinearLayout.VERTICAL);
+                  updateBox.addView(label(act, "UNIVERSE ID (OPTIONAL)"));
+                  final EditText etUniverse = ui.input(act, "", "Looked up automatically if empty", true, false);
+                  updateBox.addView(etUniverse);
+                  updateBox.addView(label(act, "PLACE ID"));
+                  final EditText etPlace = ui.input(act, "", "Place ID to overwrite", true, false);
+                  updateBox.addView(etPlace);
+                  updateBox.addView(label(act, "OPEN CLOUD API KEY (x-api-key)"));
+                  final EditText etKey = ui.input(act, RobloxApi.INSTANCE.apiKey(act), "API key with universe-places write", false, false);
+                  secret(etKey);
+                  updateBox.addView(etKey);
+                  root.addView(updateBox);
+
+                  // Create New Game fields
+                  final LinearLayout createBox = new LinearLayout(act);
+                  createBox.setOrientation(LinearLayout.VERTICAL);
+                  createBox.addView(label(act, "NEW GAME NAME"));
+                  final EditText etName = ui.input(act, "", "Name of the new experience", false, false);
+                  createBox.addView(etName);
+                  createBox.addView(label(act, ".ROBLOSECURITY COOKIE"));
+                  final EditText etCookie = ui.input(act, RobloxApi.INSTANCE.cookie(act), "Paste your .ROBLOSECURITY value", false, false);
+                  secret(etCookie);
+                  createBox.addView(etCookie);
+                  TextView createNote = ui.text(act, "Creates a new experience with your account, then uploads the file to its start place.", 11.0f, ui.getDIM(), false);
+                  createNote.setSingleLine(false);
+                  createNote.setPadding(0, ui.dp(act, 6.0f), 0, 0);
+                  createBox.addView(createNote);
+                  root.addView(createBox);
+
+                  final boolean[] createMode = {false};
+                  final Runnable applyMode = new Runnable() {
+                      @Override
+                      public void run() {
+                          updateBox.setVisibility(createMode[0] ? View.GONE : View.VISIBLE);
+                          createBox.setVisibility(createMode[0] ? View.VISIBLE : View.GONE);
+                          styleSeg(act, segUpdate, !createMode[0]);
+                          styleSeg(act, segCreate, createMode[0]);
+                      }
+                  };
+                  segUpdate.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          createMode[0] = false;
+                          applyMode.run();
+                      }
+                  });
+                  segCreate.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          createMode[0] = true;
+                          applyMode.run();
+                      }
+                  });
+                  applyMode.run();
+
+                  final TextView status = ui.text(act, "", 12.0f, ui.getDIM(), false);
+                  status.setSingleLine(false);
+                  status.setTextIsSelectable(true);
+                  status.setPadding(0, ui.dp(act, 12.0f), 0, ui.dp(act, 4.0f));
+                  root.addView(status);
+
+                  ScrollView scroll = new ScrollView(act);
+                  scroll.addView(root);
+
+                  final AlertDialog dlg = Dialogs.INSTANCE.themed(act)
+                          .setView(scroll)
+                          .setPositiveButton("Publish", null)
+                          .setNegativeButton("Close", null)
+                          .create();
+                  dlg.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                      @Override
+                      public void onDismiss(android.content.DialogInterface d) {
+                          pickedListener = null;
+   
